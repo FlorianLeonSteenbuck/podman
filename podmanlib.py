@@ -1,36 +1,33 @@
 # -*- coding: utf-8 -*-
-"""podmanlib - the one library behind the podman environment scripts.
+"""podmanlib - the Python rewrite of Go code from the podman-container-tools projects.
 
-The main-based scripts next to this file (sync_repos.py, repo_status.py,
-go_deps.py, make_all.py) hold no logic of their own: they pick a command
-and call into this module. Python 2.7 and 3.x compatible. No argparse:
-the command comes from sys.argv, options come from environment variables
-(PODMAN_ENV_REPOS, PODMAN_ENV_FORMAT).
+This is a rewrite, not a binding: nothing here imports or runs the Go code.
+The Go identifiers are kept on purpose, so each Python function can be read
+next to the Go function it came from. Python 2.7 and 3.x compatible.
 
-Design patterns
-  Singleton  PodmanEnvironment.instance()
-  Factory    RepoFactory builds RepoSpec objects, make_formatter() builds formatters
-  Facade     PodmanEnvironment hides git, make and go.mod handling
-  Command    Operation subclasses, executed by an Invoker
-  Template   Operation.run() is the fixed skeleton, subclasses fill the hooks
-  Observer   EventBus informs ConsoleObserver / RecordingObserver
-  Strategy   Formatter subclasses: TableFormatter, JsonFormatter, DotFormatter
+Ported so far
+  Part 1  golang.org/x/mod/semver       vendored in podman and container-libs
+  Part 2  go.mod reader                 own code, Go syntax subset
+  Part 3  github.com/opencontainers/go-digest v1.0.0 (validation parts)
+  Part 4  container-libs image/docker/reference     (image name parsing)
 
-Part 1 is a line-by-line port of golang.org/x/mod/semver (semver.go), the copy
-vendored in repos/podman/vendor/golang.org/x/mod/semver/. Go identifiers are
-kept on purpose so the two files can be read side by side.
-Part 2 reads go.mod files (module, require, replace).
-Part 3 is the environment: catalogue, git and make operations, module graph.
+Not ported yet: FamiliarMatch (needs Go's path.Match), the Field encoding
+helper, and everything else in podman, container-libs (common, image
+transports and copy, storage), skopeo, buildah and podman-machine-os.
+
+Design patterns used
+  Factory      getBestReferenceType() picks the reference type that fits the parts
+  Composition  Go struct embedding (namedRepository) becomes a base class
+  Interfaces   Named, Tagged, NamedTagged, CanonicalReference, Digested are base classes;
+               Go type assertions become isinstance() checks
+  Null object  Go's nil references become None where Go returns nil
 """
 
 from __future__ import absolute_import, division, print_function
 
 import functools
-import io
-import json
-import os
+import re
 import subprocess
-import sys
 from collections import OrderedDict
 
 
@@ -366,6 +363,7 @@ class GoMod(object):
 
     def __init__(self):
         self.module = ""
+        self.go_version = ""           # the "go" directive, e.g. "1.26.0"
         self.requires = OrderedDict()  # module path -> version
         self.replaces = OrderedDict()  # module path -> replacement target
 
@@ -407,39 +405,574 @@ def parse_go_mod(text):
             block = verb
         elif verb == "module" and len(fields) >= 2:
             mod.module = _unquote(fields[1])
+        elif verb == "go" and len(fields) >= 2:
+            mod.go_version = fields[1]
         elif verb in ("require", "replace"):
             _apply_directive(mod, verb, fields[1:])
     return mod
 
 
 # ===========================================================================
-# Part 3: the environment
+# Part 3: port of github.com/opencontainers/go-digest v1.0.0
+#         (digest.go and algorithm.go, the parts the reference package needs)
 # ===========================================================================
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-
-OK = "ok"
-FAIL = "fail"
-SKIP = "skip"
-
-# name, clone url, role. Order is the order of every report.
-CATALOGUE = (
-    ("podman", "https://github.com/podman-container-tools/podman.git",
-     "container engine"),
-    ("container-libs", "https://github.com/podman-container-tools/container-libs.git",
-     "shared Go modules: common, image/v5, storage"),
-    ("skopeo", "https://github.com/podman-container-tools/skopeo.git",
-     "work with remote image registries"),
-    ("buildah", "https://github.com/podman-container-tools/buildah.git",
-     "build OCI images"),
-    ("podman-machine-os", "https://github.com/podman-container-tools/podman-machine-os.git",
-     "machine image files"),
-)
+_RE_FLAGS = getattr(re, "ASCII", 0)  # Go's \w and character classes are ASCII-only
 
 
-# ---------------------------------------------------------------------------
-# Shell helper
-# ---------------------------------------------------------------------------
+def _blen(s):
+    """Go len(): the number of bytes, not characters."""
+    if isinstance(s, bytes):
+        return len(s)
+    return len(s.encode("utf-8"))
+
+
+def _g(group):
+    """Go returns "" for a capture group that did not participate."""
+    return "" if group is None else group
+
+
+class DigestError(ValueError):
+    """go-digest error. str() is the exact Go message."""
+
+
+class RefError(ValueError):
+    """Reference error. str() is the exact Go message."""
+
+
+DIGEST_ERR_INVALID_FORMAT = "invalid checksum digest format"
+DIGEST_ERR_INVALID_LENGTH = "invalid checksum digest length"
+DIGEST_ERR_UNSUPPORTED = "unsupported digest algorithm"
+
+SHA256 = "sha256"
+SHA384 = "sha384"
+SHA512 = "sha512"
+
+# Go: algorithms (crypto.Hash.Size() in bytes; the hex length is twice this).
+_ALGORITHM_SIZE = {SHA256: 32, SHA384: 48, SHA512: 64}
+
+# Go: anchoredEncodedRegexps. \Z is Go's $ (Python's $ also matches before a final newline).
+_ANCHORED_ENCODED = {
+    SHA256: re.compile(r"^[a-f0-9]{64}\Z", _RE_FLAGS),
+    SHA384: re.compile(r"^[a-f0-9]{96}\Z", _RE_FLAGS),
+    SHA512: re.compile(r"^[a-f0-9]{128}\Z", _RE_FLAGS),
+}
+
+# Go: DigestRegexpAnchored. Tells "unsupported algorithm" from "invalid format".
+DigestRegexpAnchored = re.compile(
+    r"^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]+\Z", _RE_FLAGS)
+
+
+def algorithm_available(alg):
+    """Go: Algorithm.Available(). Only sha256, sha384 and sha512 are known."""
+    return alg in _ALGORITHM_SIZE
+
+
+def algorithm_validate(alg, encoded):
+    """Go: Algorithm.Validate(encoded)."""
+    regex = _ANCHORED_ENCODED.get(alg)
+    if regex is None:
+        raise DigestError(DIGEST_ERR_UNSUPPORTED)
+    if _ALGORITHM_SIZE[alg] * 2 != _blen(encoded):
+        raise DigestError(DIGEST_ERR_INVALID_LENGTH)
+    if regex.match(encoded) is not None:
+        return
+    raise DigestError(DIGEST_ERR_INVALID_FORMAT)
+
+
+def digest_parse(s):
+    """Go: digest.Parse(s). Returns s when valid, raises DigestError otherwise."""
+    i = s.find(":")
+    if i <= 0 or i + 1 == len(s):
+        raise DigestError(DIGEST_ERR_INVALID_FORMAT)
+    alg, encoded = s[:i], s[i + 1:]
+    if not algorithm_available(alg):
+        if DigestRegexpAnchored.match(s) is None:
+            raise DigestError(DIGEST_ERR_INVALID_FORMAT)
+        raise DigestError(DIGEST_ERR_UNSUPPORTED)
+    algorithm_validate(alg, encoded)
+    return s
+
+
+# ===========================================================================
+# Part 4: port of github.com/containers/container-libs image/docker/reference
+#         (reference.go, normalize.go, regexp.go, helpers.go, regexp-additions.go)
+# ===========================================================================
+
+NAME_TOTAL_LENGTH_MAX = 255
+DEFAULT_DOMAIN = "docker.io"
+DEFAULT_TAG = "latest"
+LEGACY_DEFAULT_DOMAIN = "index.docker.io"
+OFFICIAL_REPO_NAME = "library"
+
+# Error texts, exactly as the Go package reports them.
+ERR_REFERENCE_INVALID_FORMAT = "invalid reference format"
+ERR_TAG_INVALID_FORMAT = "invalid tag format"
+ERR_REF_DIGEST_INVALID_FORMAT = "invalid digest format"
+ERR_NAME_CONTAINS_UPPERCASE = "repository name must be lowercase"
+ERR_NAME_EMPTY = "repository name must have at least one component"
+ERR_NAME_TOO_LONG = "repository name must not be more than 255 characters"
+ERR_NAME_NOT_CANONICAL = "repository name must be canonical"
+ERR_NORMALIZE_UPPERCASE = "invalid reference format: repository name must be lowercase"
+
+
+# Go: regexp.go helpers. Each returns a pattern string, as in the Go code.
+def _literal(s):
+    return re.escape(s)
+
+
+def _expression(*res):
+    return "".join(res)
+
+
+def _group(*res):
+    return "(?:" + _expression(*res) + ")"
+
+
+def _optional(*res):
+    return _group(*res) + "?"
+
+
+def _repeated(*res):
+    return _group(*res) + "+"
+
+
+def _capture(*res):
+    return "(" + _expression(*res) + ")"
+
+
+def _anchored(*res):
+    return "^" + _expression(*res) + r"\Z"
+
+
+# Go: regexp.go patterns.
+_alphaNumeric = r"[a-z0-9]+"
+# Go: [-]* can match empty. Python's re backtracks exponentially on that
+# (alnum+ (sep alnum+)* with an empty sep), so -+ is used. The language is the
+# same: two adjacent alnum runs with an empty separator form one alnum run.
+_separator = r"(?:[._]|__|-+)"
+_domainComponent = r"(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])"
+_tag = r"[\w][\w.-]{0,127}"
+_digestPat = (r"[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*"
+              r"[:][0-9A-Fa-f]{32,}")
+_identifier = r"([a-f0-9]{64})"
+_shortIdentifier = r"([a-f0-9]{6,64})"
+
+_nameComponent = _expression(
+    _alphaNumeric, _optional(_repeated(_separator, _alphaNumeric)))
+_domain = _expression(
+    _domainComponent,
+    _optional(_repeated(_literal("."), _domainComponent)),
+    _optional(_literal(":"), r"[0-9]+"))
+_namePat = _expression(
+    _optional(_domain, _literal("/")),
+    _nameComponent,
+    _optional(_repeated(_literal("/"), _nameComponent)))
+_anchoredName = _anchored(
+    _optional(_capture(_domain), _literal("/")),
+    _capture(_nameComponent, _optional(_repeated(_literal("/"), _nameComponent))))
+_referencePat = _anchored(
+    _capture(_namePat),
+    _optional(_literal(":"), _capture(_tag)),
+    _optional(_literal("@"), _capture(_digestPat)))
+
+DomainRegexp = re.compile(_domain, _RE_FLAGS)
+TagRegexp = re.compile(_tag, _RE_FLAGS)
+DigestRegexp = re.compile(_digestPat, _RE_FLAGS)
+NameRegexp = re.compile(_namePat, _RE_FLAGS)
+ReferenceRegexp = re.compile(_referencePat, _RE_FLAGS)
+IdentifierRegexp = re.compile(_identifier, _RE_FLAGS)
+ShortIdentifierRegexp = re.compile(_shortIdentifier, _RE_FLAGS)
+anchoredTagRegexp = re.compile(_anchored(_tag), _RE_FLAGS)
+anchoredDigestRegexp = re.compile(_anchored(_digestPat), _RE_FLAGS)
+anchoredNameRegexp = re.compile(_anchoredName, _RE_FLAGS)
+anchoredIdentifierRegexp = re.compile(_anchored(_identifier), _RE_FLAGS)
+
+
+# Go interfaces. Go's type assertions (ref.(Named)) become isinstance checks.
+class Reference(object):
+    def String(self):
+        raise NotImplementedError
+
+
+class Named(Reference):
+    def Name(self):
+        raise NotImplementedError
+
+
+class Tagged(Reference):
+    def Tag(self):
+        raise NotImplementedError
+
+
+class NamedTagged(Named, Tagged):
+    pass
+
+
+class Digested(Reference):
+    def Digest(self):
+        raise NotImplementedError
+
+
+class CanonicalReference(Named, Digested):
+    pass
+
+
+class NamedRepository(Named):
+    """Go: namedRepository. A named reference with domain and path."""
+
+    def Domain(self):
+        raise NotImplementedError
+
+    def Path(self):
+        raise NotImplementedError
+
+
+class NormalizedNamed(Named):
+    """Go: normalizedNamed. A name that can be shown in its familiar form."""
+
+    def Familiar(self):
+        raise NotImplementedError
+
+
+class repository(NamedRepository, NormalizedNamed):
+    def __init__(self, domain="", path=""):
+        self.domain = domain
+        self.path = path
+
+    def String(self):
+        return self.Name()
+
+    def Name(self):
+        if self.domain == "":
+            return self.path
+        return self.domain + "/" + self.path
+
+    def Domain(self):
+        return self.domain
+
+    def Path(self):
+        return self.path
+
+    def Familiar(self):
+        return familiarizeName(self)
+
+
+class reference(NamedRepository, NamedTagged, CanonicalReference, NormalizedNamed):
+    def __init__(self, domain, path, tag, digest):
+        self.domain = domain
+        self.path = path
+        self.tag = tag
+        self.digest = digest
+
+    def String(self):
+        return self.Name() + ":" + self.tag + "@" + self.digest
+
+    def Name(self):
+        return repository(self.domain, self.path).Name()
+
+    def Domain(self):
+        return self.domain
+
+    def Path(self):
+        return self.path
+
+    def Tag(self):
+        return self.tag
+
+    def Digest(self):
+        return self.digest
+
+    def Familiar(self):
+        fam = familiarizeName(self)
+        return reference(fam.domain, fam.path, self.tag, self.digest)
+
+
+class taggedReference(NamedRepository, NamedTagged, NormalizedNamed):
+    def __init__(self, domain, path, tag):
+        self.domain = domain
+        self.path = path
+        self.tag = tag
+
+    def String(self):
+        return self.Name() + ":" + self.tag
+
+    def Name(self):
+        return repository(self.domain, self.path).Name()
+
+    def Domain(self):
+        return self.domain
+
+    def Path(self):
+        return self.path
+
+    def Tag(self):
+        return self.tag
+
+    def Familiar(self):
+        fam = familiarizeName(self)
+        return taggedReference(fam.domain, fam.path, self.tag)
+
+
+class canonicalReference(NamedRepository, CanonicalReference, NormalizedNamed):
+    def __init__(self, domain, path, digest):
+        self.domain = domain
+        self.path = path
+        self.digest = digest
+
+    def String(self):
+        return self.Name() + "@" + self.digest
+
+    def Name(self):
+        return repository(self.domain, self.path).Name()
+
+    def Domain(self):
+        return self.domain
+
+    def Path(self):
+        return self.path
+
+    def Digest(self):
+        return self.digest
+
+    def Familiar(self):
+        fam = familiarizeName(self)
+        return canonicalReference(fam.domain, fam.path, self.digest)
+
+
+class digestReference(Digested):
+    def __init__(self, digest):
+        self.digest = digest
+
+    def String(self):
+        return self.digest
+
+    def Digest(self):
+        return self.digest
+
+
+def familiarizeName(named):
+    """Go: familiarizeName. Drops the default domain and the library/ prefix."""
+    repo = repository(named.Domain(), named.Path())
+    if repo.domain == DEFAULT_DOMAIN:
+        repo.domain = ""
+        parts = repo.path.split("/")
+        if len(parts) == 2 and parts[0] == OFFICIAL_REPO_NAME:
+            repo.path = parts[1]
+    return repo
+
+
+def IsNameOnly(ref):
+    """Go: IsNameOnly. True when ref carries neither a tag nor a digest."""
+    if isinstance(ref, NamedTagged):
+        return False
+    if isinstance(ref, CanonicalReference):
+        return False
+    return True
+
+
+def FamiliarName(ref):
+    if isinstance(ref, NormalizedNamed):
+        return ref.Familiar().Name()
+    return ref.Name()
+
+
+def FamiliarString(ref):
+    if isinstance(ref, NormalizedNamed):
+        return ref.Familiar().String()
+    return ref.String()
+
+
+def IsFullIdentifier(s):
+    """Go: regexp-additions.go. True if s fully matches IdentifierRegexp."""
+    return anchoredIdentifierRegexp.search(s) is not None
+
+
+def splitDomain(name):
+    match = anchoredNameRegexp.search(name)
+    if match is None:
+        return "", name
+    return _g(match.group(1)), _g(match.group(2))
+
+
+def Domain(named):
+    if isinstance(named, NamedRepository):
+        return named.Domain()
+    domain, _ = splitDomain(named.Name())
+    return domain
+
+
+def Path(named):
+    if isinstance(named, NamedRepository):
+        return named.Path()
+    _, path = splitDomain(named.Name())
+    return path
+
+
+def SplitHostname(named):
+    """Go: SplitHostname (deprecated in Go, kept for the port)."""
+    if isinstance(named, NamedRepository):
+        return named.Domain(), named.Path()
+    return splitDomain(named.Name())
+
+
+def getBestReferenceType(ref):
+    """Go: getBestReferenceType. A factory: picks the type that fits the parts."""
+    if ref.Name() == "":
+        if ref.digest != "":
+            return digestReference(ref.digest)
+        return None
+    if ref.tag == "":
+        if ref.digest != "":
+            return canonicalReference(ref.domain, ref.path, ref.digest)
+        return repository(ref.domain, ref.path)
+    if ref.digest == "":
+        return taggedReference(ref.domain, ref.path, ref.tag)
+    return ref
+
+
+def Parse(s):
+    """Go: Parse. Syntactically valid reference or RefError (DigestError for a bad digest)."""
+    matches = ReferenceRegexp.search(s)
+    if matches is None:
+        if s == "":
+            raise RefError(ERR_NAME_EMPTY)
+        if ReferenceRegexp.search(s.lower()) is not None:
+            raise RefError(ERR_NAME_CONTAINS_UPPERCASE)
+        raise RefError(ERR_REFERENCE_INVALID_FORMAT)
+
+    name = _g(matches.group(1))
+    tag = _g(matches.group(2))
+    dgst = _g(matches.group(3))
+    if _blen(name) > NAME_TOTAL_LENGTH_MAX:
+        raise RefError(ERR_NAME_TOO_LONG)
+
+    nameMatch = anchoredNameRegexp.search(name)
+    if nameMatch is not None:
+        repo = repository(_g(nameMatch.group(1)), _g(nameMatch.group(2)))
+    else:
+        repo = repository("", name)
+
+    ref = reference(repo.domain, repo.path, tag, "")
+    if dgst != "":
+        ref.digest = digest_parse(dgst)
+
+    r = getBestReferenceType(ref)
+    if r is None:
+        raise RefError(ERR_NAME_EMPTY)
+    return r
+
+
+def ParseNormalizedNamed(s):
+    """Go: ParseNormalizedNamed. Turns a familiar name into a fully qualified one."""
+    if anchoredIdentifierRegexp.search(s) is not None:
+        raise RefError("invalid repository name (%s), cannot specify 64-byte hexadecimal strings" % s)
+    domain, remainder = splitDockerDomain(s)
+    tagSep = remainder.find(":")
+    if tagSep > -1:
+        remoteName = remainder[:tagSep]
+    else:
+        remoteName = remainder
+    if remoteName.lower() != remoteName:
+        raise RefError(ERR_NORMALIZE_UPPERCASE)
+
+    ref = Parse(domain + "/" + remainder)
+    if not isinstance(ref, Named):
+        raise RefError("reference %s has no name" % ref.String())
+    return ref
+
+
+def ParseDockerRef(ref):
+    """Go: ParseDockerRef. Like ParseNormalizedNamed; tag and digest give the digest only."""
+    named = ParseNormalizedNamed(ref)
+    if isinstance(named, NamedTagged) and isinstance(named, CanonicalReference):
+        newNamed = WithName(named.Name())
+        return WithDigest(newNamed, named.Digest())
+    return TagNameOnly(named)
+
+
+def splitDockerDomain(name):
+    """Go: splitDockerDomain. The name must already be validated."""
+    i = name.find("/")
+    if i == -1 or (not any(ch in ".:" for ch in name[:i]) and name[:i] != "localhost"):
+        domain, remainder = DEFAULT_DOMAIN, name
+    else:
+        domain, remainder = name[:i], name[i + 1:]
+    if domain == LEGACY_DEFAULT_DOMAIN:
+        domain = DEFAULT_DOMAIN
+    if domain == DEFAULT_DOMAIN and "/" not in remainder:
+        remainder = OFFICIAL_REPO_NAME + "/" + remainder
+    return domain, remainder
+
+
+def TagNameOnly(ref):
+    """Go: TagNameOnly. Adds the default tag when ref is a bare name."""
+    if IsNameOnly(ref):
+        return WithTag(ref, DEFAULT_TAG)
+    return ref
+
+
+def ParseAnyReference(ref):
+    """Go: ParseAnyReference (deprecated in Go: 64 hex characters are read as sha256)."""
+    if anchoredIdentifierRegexp.search(ref) is not None:
+        return digestReference("sha256:" + ref)
+    try:
+        digest_parse(ref)
+    except DigestError:
+        return ParseNormalizedNamed(ref)
+    return digestReference(ref)
+
+
+def ParseNamed(s):
+    """Go: ParseNamed. Like ParseNormalizedNamed, but s must already be canonical."""
+    named = ParseNormalizedNamed(s)
+    if named.String() != s:
+        raise RefError(ERR_NAME_NOT_CANONICAL)
+    return named
+
+
+def WithName(name):
+    if _blen(name) > NAME_TOTAL_LENGTH_MAX:
+        raise RefError(ERR_NAME_TOO_LONG)
+    match = anchoredNameRegexp.search(name)
+    if match is None:
+        raise RefError(ERR_REFERENCE_INVALID_FORMAT)
+    return repository(_g(match.group(1)), _g(match.group(2)))
+
+
+def WithTag(name, tag):
+    if anchoredTagRegexp.search(tag) is None:
+        raise RefError(ERR_TAG_INVALID_FORMAT)
+    if isinstance(name, NamedRepository):
+        domain, path = name.Domain(), name.Path()
+    else:
+        domain, path = "", name.Name()
+    if isinstance(name, CanonicalReference):
+        return reference(domain, path, tag, name.Digest())
+    return taggedReference(domain, path, tag)
+
+
+def WithDigest(name, dgst):
+    if anchoredDigestRegexp.search(dgst) is None:
+        raise RefError(ERR_REF_DIGEST_INVALID_FORMAT)
+    if isinstance(name, NamedRepository):
+        domain, path = name.Domain(), name.Path()
+    else:
+        domain, path = "", name.Name()
+    if isinstance(name, Tagged):
+        return reference(domain, path, name.Tag(), dgst)
+    return canonicalReference(domain, path, dgst)
+
+
+def TrimNamed(ref):
+    """Go: TrimNamed. Removes any tag or digest from the name."""
+    domain, path = SplitHostname(ref)
+    return repository(domain, path)
+
+
+# ===========================================================================
+# Shell helper for the check scripts (not part of the rewrite itself)
+# ===========================================================================
 
 
 class CommandResult(object):
@@ -452,12 +985,6 @@ class CommandResult(object):
     @property
     def ok(self):
         return self.returncode == 0
-
-    def last_error(self):
-        lines = [l.strip() for l in self.stderr.splitlines() if l.strip()]
-        if lines:
-            return lines[-1]
-        return "exit code %d" % self.returncode
 
 
 def _text(data):
@@ -475,466 +1002,3 @@ def run(argv, cwd=None):
         return CommandResult(argv, 127, "", str(exc))
     out, err = proc.communicate()
     return CommandResult(argv, proc.returncode, _text(out), _text(err))
-
-
-def git(cwd, *args):
-    return run(["git"] + list(args), cwd=cwd)
-
-
-# ---------------------------------------------------------------------------
-# Factory: repo specs
-# ---------------------------------------------------------------------------
-
-
-class RepoSpec(object):
-    def __init__(self, name, url, role, repos_dir):
-        self.name = name
-        self.url = url
-        self.role = role
-        self.path = os.path.join(repos_dir, name)
-        self.relpath = "repos/" + name  # as git sees it from the top repo
-
-    def is_checked_out(self):
-        return os.path.exists(os.path.join(self.path, ".git"))
-
-
-class RepoFactory(object):
-    def __init__(self, repos_dir):
-        self.repos_dir = repos_dir
-
-    def build(self, catalogue=CATALOGUE, selection=None):
-        known = set(name for name, _, _ in catalogue)
-        if selection:
-            unknown = [n for n in selection if n not in known]
-            if unknown:
-                raise ValueError("unknown repo(s): %s" % ", ".join(unknown))
-        return [RepoSpec(name, url, role, self.repos_dir)
-                for name, url, role in catalogue
-                if not selection or name in selection]
-
-
-def selected_names():
-    """PODMAN_ENV_REPOS=podman,skopeo limits the repos; unset means all."""
-    raw = os.environ.get("PODMAN_ENV_REPOS", "").strip()
-    if not raw:
-        return None
-    return [n.strip() for n in raw.split(",") if n.strip()]
-
-
-def command_name(argv, commands):
-    """Return the first positional argument if it is a known command, else None."""
-    if len(argv) < 2:
-        return None
-    if argv[1] in commands:
-        return argv[1]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Observer: event bus
-# ---------------------------------------------------------------------------
-
-
-class Observer(object):
-    def update(self, event, payload):
-        pass
-
-
-class EventBus(object):
-    def __init__(self):
-        self._observers = []
-
-    def attach(self, observer):
-        self._observers.append(observer)
-
-    def notify(self, event, **payload):
-        for observer in self._observers:
-            observer.update(event, payload)
-
-
-class ConsoleObserver(Observer):
-    def __init__(self, stream=None):
-        self.stream = stream or sys.stdout
-
-    def update(self, event, payload):
-        if event in (OK, FAIL, SKIP):
-            line = "[%-4s] %-14s %-18s %s" % (event, payload["op"], payload["repo"],
-                                              payload.get("detail", ""))
-            self.stream.write(line.rstrip() + "\n")
-
-
-class RecordingObserver(Observer):
-    def __init__(self):
-        self.events = []
-
-    def update(self, event, payload):
-        self.events.append((event, payload))
-
-
-# ---------------------------------------------------------------------------
-# Command + Template Method: operations on repos
-# ---------------------------------------------------------------------------
-
-
-class Outcome(object):
-    def __init__(self, op, repo, status, detail=""):
-        self.op = op
-        self.repo = repo
-        self.status = status
-        self.detail = detail
-
-
-class Operation(object):
-    """Command: one unit of work on one repo.
-
-    run() is the Template Method: start event, precheck, perform, result event.
-    Subclasses override precheck() and perform() only.
-    """
-
-    name = "operation"
-
-    def __init__(self, repo, root=ROOT):
-        self.repo = repo
-        self.root = root
-
-    def precheck(self):
-        """Return (True, "") to go ahead, or (False, reason) to skip."""
-        return True, ""
-
-    def perform(self):
-        """Return (status, detail)."""
-        raise NotImplementedError
-
-    def run(self, bus):
-        bus.notify("start", op=self.name, repo=self.repo.name, detail="")
-        ok, reason = self.precheck()
-        if ok:
-            status, detail = self.perform()
-        else:
-            status, detail = SKIP, reason
-        bus.notify(status, op=self.name, repo=self.repo.name, detail=detail)
-        return Outcome(self.name, self.repo.name, status, detail)
-
-
-class PinSubmodule(Operation):
-    """Check out the commit this repo records for the submodule."""
-
-    name = "pin"
-
-    def perform(self):
-        res = git(self.root, "submodule", "update", "--init", "--", self.repo.relpath)
-        if res.ok:
-            return OK, "recorded commit checked out"
-        return FAIL, res.last_error()
-
-
-class LatestSubmodule(Operation):
-    """Fetch upstream and move the submodule to origin/HEAD (detached)."""
-
-    name = "latest"
-
-    def precheck(self):
-        if not self.repo.is_checked_out():
-            return False, "not checked out (run pin first)"
-        return True, ""
-
-    def perform(self):
-        fetched = git(self.repo.path, "fetch", "--tags", "--prune", "origin")
-        if not fetched.ok:
-            return FAIL, fetched.last_error()
-        moved = git(self.repo.path, "checkout", "--detach", "origin/HEAD")
-        if not moved.ok:
-            return FAIL, moved.last_error()
-        sha = git(self.repo.path, "rev-parse", "--short", "HEAD").stdout.strip()
-        return OK, "now at %s" % sha
-
-
-class MakeTarget(Operation):
-    """Run `make <target>` in the repo, if it has a Makefile with that target."""
-
-    def __init__(self, repo, target, root=ROOT):
-        Operation.__init__(self, repo, root)
-        self.target = target
-        self.name = "make:" + target
-
-    def precheck(self):
-        if not self.repo.is_checked_out():
-            return False, "not checked out"
-        if not os.path.exists(os.path.join(self.repo.path, "Makefile")):
-            return False, "no Makefile"
-        if not run(["make", "-n", self.target], cwd=self.repo.path).ok:
-            return False, "no target '%s'" % self.target
-        return True, ""
-
-    def perform(self):
-        res = run(["make", self.target], cwd=self.repo.path)
-        if res.ok:
-            return OK, "done"
-        return FAIL, res.last_error()
-
-
-class Invoker(object):
-    """Runs Commands, keeps a history."""
-
-    def __init__(self, bus):
-        self.bus = bus
-        self.history = []
-
-    def execute(self, op):
-        outcome = op.run(self.bus)
-        self.history.append(outcome)
-        return outcome
-
-    def execute_all(self, ops):
-        return [self.execute(op) for op in ops]
-
-
-def any_failed(outcomes):
-    return any(o.status == FAIL for o in outcomes)
-
-
-# ---------------------------------------------------------------------------
-# Strategy + Factory: output formats
-# ---------------------------------------------------------------------------
-
-
-class Formatter(object):
-    def render(self, rows):
-        raise NotImplementedError
-
-
-class TableFormatter(Formatter):
-    def render(self, rows):
-        if not rows:
-            return ""
-        columns = list(rows[0].keys())
-        widths = {}
-        for c in columns:
-            widths[c] = max([len(c)] + [len(str(r.get(c, ""))) for r in rows])
-        lines = ["  ".join(c.ljust(widths[c]) for c in columns)]
-        lines.append("  ".join("-" * widths[c] for c in columns))
-        for r in rows:
-            lines.append("  ".join(str(r.get(c, "")).ljust(widths[c]) for c in columns))
-        return "\n".join(lines)
-
-
-class JsonFormatter(Formatter):
-    def render(self, rows):
-        return json.dumps(rows, indent=2)
-
-
-class DotFormatter(Formatter):
-    """Graphviz DOT. Rows need src, dst, module and drift keys."""
-
-    def render(self, rows):
-        lines = ["digraph go_modules {", "  rankdir=LR;"]
-        for r in rows:
-            label = "%s\\n%s" % (r["module"], r["drift"])
-            lines.append('  "%s" -> "%s" [label="%s"];' % (r["src"], r["dst"], label))
-        lines.append("}")
-        return "\n".join(lines)
-
-
-FORMATTERS = {
-    "table": TableFormatter,
-    "json": JsonFormatter,
-    "dot": DotFormatter,
-}
-
-
-def make_formatter(name):
-    """Factory: formatter by name. Unknown names fall back to table."""
-    return FORMATTERS.get(name, TableFormatter)()
-
-
-def output_format():
-    return os.environ.get("PODMAN_ENV_FORMAT", "table").strip().lower()
-
-
-# ---------------------------------------------------------------------------
-# Status: git state of each repo and of the submodule pins
-# ---------------------------------------------------------------------------
-
-SUBMODULE_WORDS = {" ": "in sync", "+": "moved", "-": "not init", "U": "conflict"}
-
-
-def submodule_marks(root):
-    """Map repos/<name> -> state word, from `git submodule status` in the top repo."""
-    marks = {}
-    for line in git(root, "submodule", "status").stdout.splitlines():
-        if not line:
-            continue
-        fields = line[1:].split()
-        if len(fields) >= 2:
-            marks[fields[1]] = SUBMODULE_WORDS.get(line[0], "unknown")
-    return marks
-
-
-def repo_status(repo, marks):
-    row = OrderedDict()
-    row["repo"] = repo.name
-    row["submodule"] = marks.get(repo.relpath, "not in index")
-    if not repo.is_checked_out():
-        row["branch"] = "-"
-        row["commit"] = "-"
-        row["date"] = "-"
-        row["dirty"] = "-"
-        return row
-    branch = git(repo.path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-    row["branch"] = "detached" if branch == "HEAD" else branch
-    row["commit"] = git(repo.path, "rev-parse", "--short", "HEAD").stdout.strip()
-    row["date"] = git(repo.path, "log", "-1", "--format=%cs").stdout.strip()
-    changes = [l for l in git(repo.path, "status", "--porcelain").stdout.splitlines() if l.strip()]
-    row["dirty"] = str(len(changes))
-    return row
-
-
-# ---------------------------------------------------------------------------
-# Visitor: collect go.mod files
-# ---------------------------------------------------------------------------
-
-
-class ModuleInfo(object):
-    def __init__(self, repo, rel_dir, mod):
-        self.repo = repo
-        self.rel_dir = rel_dir  # "." for the repo root
-        self.mod = mod
-
-
-class GoModuleScanner(object):
-    """Visitor: walks one repo and reads every go.mod outside vendor/."""
-
-    SKIP_DIRS = frozenset(["vendor", ".git", "testdata"])
-
-    def visit(self, repo):
-        found = []
-        if not repo.is_checked_out():
-            return found
-        for dirpath, dirnames, filenames in os.walk(repo.path):
-            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
-            if "go.mod" not in filenames:
-                continue
-            with io.open(os.path.join(dirpath, "go.mod"), encoding="utf-8",
-                         errors="replace") as fh:
-                mod = parse_go_mod(fh.read())
-            rel = os.path.relpath(dirpath, repo.path).replace(os.sep, "/")
-            found.append(ModuleInfo(repo, rel, mod))
-        return found
-
-
-def local_version(repo, rel_dir):
-    """Highest semver tag of the module in rel_dir ("" if none).
-
-    Module tags are "v1.2.3" in the root and "<dir>/v1.2.3" in a subdirectory.
-    """
-    prefix = "" if rel_dir == "." else rel_dir + "/"
-    res = git(repo.path, "tag", "--list", prefix + "v*")
-    versions = []
-    for tag in res.stdout.splitlines():
-        tag = tag.strip()
-        if not tag.startswith(prefix):
-            continue
-        v = tag[len(prefix):]
-        if "/" not in v and IsValid(v):
-            versions.append(v)
-    if not versions:
-        return ""
-    Sort(versions)
-    return versions[-1]
-
-
-def drift_of(required, local):
-    """Compare the version a module requires with the highest local tag."""
-    if not IsValid(required):
-        return "invalid"
-    if local == "":
-        return "no tag"
-    c = Compare(required, local)
-    if c == 0:
-        return "same"
-    if c < 0:
-        return "older"
-    return "newer (untagged)"
-
-
-class ModuleGraph(object):
-    """Directed graph of cross-repo go module requirements."""
-
-    def __init__(self, modules):
-        self.modules = modules
-        self.owner = OrderedDict()
-        for info in modules:
-            if info.mod.module:
-                self.owner[info.mod.module] = info
-
-    def edges(self):
-        rows = []
-        local_cache = {}
-        for info in self.modules:
-            for req, version in info.mod.requires.items():
-                target = self.owner.get(req)
-                if target is None or target.repo.name == info.repo.name:
-                    continue
-                key = (target.repo.name, target.rel_dir)
-                if key not in local_cache:
-                    local_cache[key] = local_version(target.repo, target.rel_dir)
-                local = local_cache[key]
-                row = OrderedDict()
-                row["src"] = info.repo.name
-                row["dst"] = target.repo.name
-                row["module"] = req
-                row["required"] = version
-                row["local"] = local
-                row["drift"] = drift_of(version, local)
-                rows.append(row)
-        rows.sort(key=lambda r: (r["src"], r["dst"], r["module"]))
-        return rows
-
-
-# ---------------------------------------------------------------------------
-# Facade: the one object the scripts talk to
-# ---------------------------------------------------------------------------
-
-
-class PodmanEnvironment(object):
-    _instance = None
-
-    @classmethod
-    def instance(cls):
-        """Singleton: one environment per process, selection from PODMAN_ENV_REPOS."""
-        if cls._instance is None:
-            try:
-                cls._instance = cls(selection=selected_names())
-            except ValueError as exc:
-                raise SystemExit("PODMAN_ENV_REPOS: %s" % exc)
-        return cls._instance
-
-    def __init__(self, root=ROOT, catalogue=CATALOGUE, selection=None, bus=None):
-        self.root = root
-        self.repos_dir = os.path.join(root, "repos")
-        self.repos = RepoFactory(self.repos_dir).build(catalogue, selection)
-        self.bus = bus or EventBus()
-        self.invoker = Invoker(self.bus)
-
-    def pin(self):
-        return self.invoker.execute_all(
-            [PinSubmodule(r, self.root) for r in self.repos])
-
-    def latest(self):
-        return self.invoker.execute_all(
-            [LatestSubmodule(r, self.root) for r in self.repos])
-
-    def make(self, target):
-        return self.invoker.execute_all(
-            [MakeTarget(r, target, self.root) for r in self.repos])
-
-    def status(self):
-        marks = submodule_marks(self.root)
-        return [repo_status(r, marks) for r in self.repos]
-
-    def go_graph(self):
-        scanner = GoModuleScanner()
-        modules = []
-        for repo in self.repos:
-            modules.extend(scanner.visit(repo))
-        return ModuleGraph(modules)

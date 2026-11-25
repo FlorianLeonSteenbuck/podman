@@ -2,12 +2,7 @@
 """Tests for podmanlib. Run: python test_podmanlib.py"""
 from __future__ import absolute_import, print_function
 
-import json
-import os
-import shutil
-import tempfile
 import unittest
-from collections import OrderedDict
 
 import podmanlib as pl
 
@@ -75,6 +70,7 @@ class GoModTest(unittest.TestCase):
     def test_parse(self):
         mod = pl.parse_go_mod(self.SAMPLE)
         self.assertEqual(mod.module, "go.podman.io/podman/v6")
+        self.assertEqual(mod.go_version, "1.24.0")
         self.assertEqual(mod.requires["go.podman.io/common"],
                          "v0.70.1-0.20261116084638-6da6e80dc141")
         self.assertEqual(mod.requires["github.com/x/y"], "v1.2.3")
@@ -84,121 +80,70 @@ class GoModTest(unittest.TestCase):
         self.assertEqual(mod.replaces["github.com/c/d"], "github.com/e/f v2.0.0")
 
 
-class DriftTest(unittest.TestCase):
-    def test_drift_words(self):
-        self.assertEqual(pl.drift_of("v1.0.0", "v1.0.0"), "same")
-        self.assertEqual(pl.drift_of("v0.1.0", "v0.2.0"), "older")
-        self.assertEqual(pl.drift_of("v0.70.1-0.2026-abc", "v0.70.0"), "newer (untagged)")
-        self.assertEqual(pl.drift_of("v1.0.0", ""), "no tag")
-        self.assertEqual(pl.drift_of("nope", "v1.0.0"), "invalid")
+class DigestPortTest(unittest.TestCase):
+    def test_valid_sha256(self):
+        d = "sha256:" + "a" * 64
+        self.assertEqual(pl.digest_parse(d), d)
+
+    def test_length_format_and_algorithm_errors(self):
+        cases = [
+            ("sha256:" + "a" * 63, "invalid checksum digest length"),
+            ("sha256:" + "Z" * 64, "invalid checksum digest format"),
+            ("md5:" + "a" * 32, "unsupported digest algorithm"),
+            (":" + "a" * 64, "invalid checksum digest format"),
+            ("sha256:", "invalid checksum digest format"),
+        ]
+        for value, message in cases:
+            with self.assertRaises(pl.DigestError) as cm:
+                pl.digest_parse(value)
+            self.assertEqual(str(cm.exception), message)
 
 
-class LocalVersionTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.repo = pl.RepoSpec("demo", "file:///unused", "test", self.tmp)
-        os.makedirs(self.repo.path)
-        self.git("init", "-q")
-        self.git("-c", "user.name=t", "-c", "user.email=t@example.com",
-                 "commit", "-q", "--allow-empty", "-m", "init")
-        for tag in ["v1.2.0", "v1.10.0", "sub/v0.3.0", "sub/v0.10.0", "sub/v0.4.0-rc1"]:
-            self.git("tag", tag)
+class ReferencePortTest(unittest.TestCase):
+    def test_familiar_and_normalized_names(self):
+        named = pl.ParseNormalizedNamed("alpine:3.20")
+        self.assertEqual(named.String(), "docker.io/library/alpine:3.20")
+        self.assertEqual(pl.FamiliarString(named), "alpine:3.20")
+        self.assertEqual(pl.FamiliarName(named), "alpine")
+        self.assertEqual(pl.Domain(named), "docker.io")
+        self.assertEqual(pl.Path(named), "library/alpine")
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
+    def test_names_must_be_lowercase(self):
+        with self.assertRaises(pl.RefError) as cm:
+            pl.ParseNormalizedNamed("Ubuntu")
+        self.assertEqual(str(cm.exception),
+                         "invalid reference format: repository name must be lowercase")
 
-    def git(self, *args):
-        res = pl.git(self.repo.path, *args)
-        self.assertTrue(res.ok, res.stderr)
-        return res
+    def test_domain_and_digest_reference(self):
+        text = "localhost:5000/a/b@sha256:" + "a" * 64
+        ref = pl.Parse(text)
+        self.assertIsInstance(ref, pl.CanonicalReference)
+        self.assertEqual(pl.Domain(ref), "localhost:5000")
+        self.assertEqual(pl.Path(ref), "a/b")
+        self.assertEqual(ref.String(), text)
 
-    def test_root_and_subdir_tags_are_separate(self):
-        self.assertEqual(pl.local_version(self.repo, "."), "v1.10.0")
-        self.assertEqual(pl.local_version(self.repo, "sub"), "v0.10.0")
-        self.assertEqual(pl.local_version(self.repo, "other"), "")
+    def test_docker_ref_keeps_only_the_digest(self):
+        text = "busybox:latest@sha256:" + "a" * 64
+        self.assertEqual(pl.ParseDockerRef(text).String(),
+                         "docker.io/library/busybox@sha256:" + "a" * 64)
 
+    def test_tag_name_only_adds_latest(self):
+        named = pl.ParseNormalizedNamed("redis")
+        self.assertEqual(pl.TagNameOnly(named).String(), "docker.io/library/redis:latest")
+        self.assertTrue(pl.IsNameOnly(named))
+        self.assertFalse(pl.IsNameOnly(pl.Parse("redis:7")))
 
-class FormatterTest(unittest.TestCase):
-    def rows(self):
-        first = OrderedDict([("repo", "a"), ("commit", "x")])
-        second = OrderedDict([("repo", "bb"), ("commit", "yy")])
-        return [first, second]
+    def test_identifier_and_any_reference(self):
+        self.assertTrue(pl.IsFullIdentifier("a" * 64))
+        self.assertFalse(pl.IsFullIdentifier("a" * 63))
+        any_ref = pl.ParseAnyReference("sha256:" + "a" * 64)
+        self.assertIsInstance(any_ref, pl.digestReference)
 
-    def test_table(self):
-        lines = pl.make_formatter("table").render(self.rows()).splitlines()
-        self.assertEqual(lines[0].split(), ["repo", "commit"])
-        self.assertEqual(lines[2].split(), ["a", "x"])
-        self.assertEqual(lines[3].split(), ["bb", "yy"])
-
-    def test_json(self):
-        data = json.loads(pl.make_formatter("json").render(self.rows()))
-        self.assertEqual(data[1]["repo"], "bb")
-
-    def test_dot(self):
-        rows = [OrderedDict([("src", "a"), ("dst", "b"), ("module", "m"), ("drift", "same")])]
-        text = pl.make_formatter("dot").render(rows)
-        self.assertTrue(text.startswith("digraph"))
-        self.assertIn('"a" -> "b"', text)
-
-    def test_unknown_format_falls_back_to_table(self):
-        self.assertIsInstance(pl.make_formatter("nope"), pl.TableFormatter)
-
-
-class OperationTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.repo = pl.RepoSpec("demo", "u", "r", self.tmp)
-        os.makedirs(os.path.join(self.repo.path, ".git"))  # pretend it is checked out
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
-
-    def test_make_skipped_without_makefile(self):
-        bus = pl.EventBus()
-        rec = pl.RecordingObserver()
-        bus.attach(rec)
-        outcome = pl.Invoker(bus).execute(pl.MakeTarget(self.repo, "help", self.tmp))
-        self.assertEqual(outcome.status, pl.SKIP)
-        self.assertEqual([e for e, _ in rec.events], ["start", "skip"])
-
-    def test_make_runs_and_reports_missing_target(self):
-        with open(os.path.join(self.repo.path, "Makefile"), "w") as fh:
-            fh.write("help:\n\t@echo hi\n")
-        invoker = pl.Invoker(pl.EventBus())
-        self.assertEqual(invoker.execute(pl.MakeTarget(self.repo, "help", self.tmp)).status,
-                         pl.OK)
-        missing = invoker.execute(pl.MakeTarget(self.repo, "nope", self.tmp))
-        self.assertEqual(missing.status, pl.SKIP)
-        self.assertIn("nope", missing.detail)
-
-    def test_latest_skipped_when_not_checked_out(self):
-        repo = pl.RepoSpec("missing", "u", "r", self.tmp)
-        outcome = pl.LatestSubmodule(repo, self.tmp).run(pl.EventBus())
-        self.assertEqual(outcome.status, pl.SKIP)
-
-    def test_missing_program_does_not_raise(self):
-        res = pl.run(["definitely-not-a-program-xyz"])
-        self.assertFalse(res.ok)
-        self.assertEqual(res.returncode, 127)
-
-
-class FactoryTest(unittest.TestCase):
-    def test_all_five_repos_in_catalogue(self):
-        names = sorted(n for n, _, _ in pl.CATALOGUE)
-        self.assertEqual(names, sorted(["podman", "container-libs", "skopeo",
-                                        "buildah", "podman-machine-os"]))
-
-    def test_selection_keeps_catalogue_order(self):
-        repos = pl.RepoFactory("/x").build(pl.CATALOGUE, ["skopeo", "podman"])
-        self.assertEqual([r.name for r in repos], ["podman", "skopeo"])
-
-    def test_unknown_name_raises(self):
-        self.assertRaises(ValueError, pl.RepoFactory("/x").build, pl.CATALOGUE, ["nope"])
-
-    def test_command_name(self):
-        self.assertEqual(pl.command_name(["x", "pin"], {"pin": 1}), "pin")
-        self.assertIsNone(pl.command_name(["x", "bogus"], {"pin": 1}))
-        self.assertIsNone(pl.command_name(["x"], {"pin": 1}))
+    def test_parse_named_requires_canonical_form(self):
+        self.assertEqual(pl.ParseNamed("docker.io/library/alpine").String(),
+                         "docker.io/library/alpine")
+        with self.assertRaises(pl.RefError):
+            pl.ParseNamed("alpine")  # canonical is docker.io/library/alpine
 
 
 if __name__ == "__main__":

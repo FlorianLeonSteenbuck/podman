@@ -1,97 +1,100 @@
-# podman – Python-Umgebung
+# podman in Python (rewrite)
 
-Dieses Repo hält die fünf Podman-Projekte als Git-Submodule unter `repos/` und
-eine Python-Bibliothek (`podmanlib.py`), die sie zusammenhält. Die Skripte im
-Hauptverzeichnis sind reine Einstiegspunkte (`if __name__ == "__main__"`) ohne
-eigene Logik. Es wird kein `argparse` verwendet: das Kommando kommt aus
-`sys.argv`, Optionen kommen aus Umgebungsvariablen.
+This repository is a Python rewrite of Go code from the podman-container-tools
+projects. It does not contain, bind, build or run those Go projects. The Go
+sources are only used as the reference that the Python code is checked against.
 
-## Repos
+The full rewrite of all five projects is a multi-stage effort. podman alone is
+several hundred thousand lines of Go. This repository currently holds the first
+parts, listed below.
 
-| Pfad                    | Upstream                                              | Rolle                                      |
-|-------------------------|-------------------------------------------------------|--------------------------------------------|
-| `repos/podman`          | podman-container-tools/podman                         | Container-Engine                           |
-| `repos/container-libs`  | podman-container-tools/container-libs                 | gemeinsame Go-Module: common, image/v5, storage |
-| `repos/skopeo`          | podman-container-tools/skopeo                         | Arbeiten mit Registries                    |
-| `repos/buildah`         | podman-container-tools/buildah                        | OCI-Images bauen                           |
-| `repos/podman-machine-os` | podman-container-tools/podman-machine-os            | Machine-Image-Dateien                      |
+## Scope
 
-Die Submodule sind vollständige Klone (rund 340 MB). Sie sind auf die Commits
-gepinnt, die dieses Repo aufzeichnet.
+| Project             | Status                                                                 |
+|---------------------|------------------------------------------------------------------------|
+| container-libs      | Ported: `golang.org/x/mod/semver` (vendored), `image/docker/reference`, go-digest validation. Not yet: `common`, image transports and copy, `storage` |
+| podman              | Not started                                                            |
+| skopeo              | Not started                                                            |
+| buildah             | Not started                                                            |
+| podman-machine-os   | Not started                                                            |
 
-## Klonen
+Not yet ported inside the ported parts: `FamiliarMatch` (needs a port of Go's
+`path.Match`) and the `Field` encoding helper of `image/docker/reference`.
+
+## Files
+
+| File                     | What it is                                                        |
+|--------------------------|-------------------------------------------------------------------|
+| `podmanlib.py`           | The library: all ported code                                      |
+| `image_reference.py`     | Main-based CLI: parses image references and prints the parts     |
+| `check_semver_port.py`   | Checks the semver port against the Go original                    |
+| `check_reference_port.py`| Checks the reference and digest ports against the Go original     |
+| `test_podmanlib.py`      | Unit tests                                                        |
+
+`podmanlib.py` is one library with four parts:
+
+1. **semver**: a line-by-line port of `golang.org/x/mod/semver/semver.go`.
+2. **go.mod reader**: `module`, `go`, `require` and `replace`, single-line and block form.
+3. **go-digest**: `digest.Parse` and the algorithm validation, from go-digest v1.0.0.
+4. **reference**: `image/docker/reference` (`Parse`, `ParseNormalizedNamed`,
+   `ParseDockerRef`, `ParseNamed`, `ParseAnyReference`, `WithName`, `WithTag`,
+   `WithDigest`, `TrimNamed`, familiar names).
+
+Go identifiers are kept on purpose, so each function can be read next to the
+Go function it came from. Go's `$` is written as `\Z` in the patterns, because
+Python's `$` also matches before a final newline.
+
+## Usage
 
 ```bash
-git clone --recurse-submodules https://github.com/FlorianLeonSteenbuck/podman.git
+python3 image_reference.py alpine:3.20 Ubuntu
+python3 test_podmanlib.py
 ```
 
-Bereits ohne Submodule geklont:
+The checks need a checkout of container-libs and the Go toolchain. The checkout is
+only read, and the Go code is built in a temporary directory. The reference
+driver fetches go-digest through the Go module proxy.
 
 ```bash
-git submodule update --init
+PODMAN_GO_REFERENCE=/path/to/container-libs python3 check_semver_port.py
+PODMAN_GO_REFERENCE=/path/to/container-libs python3 check_reference_port.py [count]
 ```
 
-## Skripte
+Exit status of the checks: 0 when every line is equal, 1 on mismatches, 2 when
+the checkout or the `go` binary is missing.
 
-```bash
-python3 sync_repos.py pin          # Submodule auf den hier gepinnten Commit setzen
-python3 sync_repos.py latest       # upstream holen, jedes Repo auf origin/HEAD
-python3 repo_status.py             # Branch, Commit, Datum, geänderte Dateien, Pin-Status
-python3 go_deps.py graph           # Go-Abhängigkeiten zwischen den Repos mit Versions-Drift
-python3 go_deps.py modules         # alle gefundenen go.mod-Dateien
-python3 make_all.py help           # make-Target in jedem Repo, das es hat
-python3 test_podmanlib.py          # Unit-Tests
-python3 check_semver_port.py       # Python-Port gegen das Go-Original prüfen (braucht go)
-```
+## Verification
 
-Umgebungsvariablen:
+Both checks run the Python port and the original Go code on the same inputs and
+compare every output line.
 
-- `PODMAN_ENV_REPOS=podman,skopeo` beschränkt alle Skripte auf diese Repos.
-- `PODMAN_ENV_FORMAT=table|json|dot` wählt das Ausgabeformat. `dot` gilt nur für `go_deps.py graph`.
+| Check                      | Inputs                                                    | Result            |
+|----------------------------|-----------------------------------------------------------|-------------------|
+| `check_semver_port.py`     | 20,841 version pairs, plus sorting of 6,695 strings        | 0 mismatches      |
+| `check_reference_port.py`  | 20,410 inputs: string literals from the package tests plus mutations | 0 mismatches |
 
-Die Drift-Spalte in `go_deps.py graph` vergleicht die Version, die ein Modul
-verlangt, mit dem höchsten lokalen Tag des Moduls:
+The reference check covers `Parse`, `ParseNormalizedNamed`, `ParseDockerRef`,
+`ParseNamed`, `ParseAnyReference`, `TagNameOnly`, `IsNameOnly`, `TrimNamed`,
+`IsFullIdentifier`, familiar names and `digest.Parse`, including the error texts.
 
-- `same`: gleiche Version
-- `older`: verlangt eine ältere Version als den Tag
-- `newer (untagged)`: verlangt eine Pseudo-Version über dem letzten Tag
-- `no tag`: kein lokaler Tag vorhanden
+One bug was found by the check work. The Go separator `[-]*` can match an empty
+string. In Python's backtracking regex engine this made parsing exponential: a
+14-character name took 25 seconds. The port uses `-+` instead. This is the same
+language, because two adjacent alphanumeric runs with an empty separator form one
+run. Go's RE2 engine is linear, so it never had the problem.
 
-## Aufbau
+## Design patterns
 
-`podmanlib.py` enthält drei Teile:
+| Pattern       | Where                                                                  |
+|---------------|------------------------------------------------------------------------|
+| Factory       | `getBestReferenceType()` picks the reference type that fits the parts  |
+| Composition   | Go struct embedding (`namedRepository`) becomes a base class            |
+| Interfaces    | `Named`, `Tagged`, `NamedTagged`, `CanonicalReference`, `Digested`; Go type assertions become `isinstance()` |
 
-1. **Port von `golang.org/x/mod/semver`**, Funktion für Funktion aus dem
-   vendorten `semver.go` übersetzt. Die Go-Bezeichner sind beibehalten, damit
-   beide Dateien nebeneinander gelesen werden können.
-2. **go.mod-Leser** für `module`, `require` (Einzelzeile und Block) und `replace`.
-3. **Die Umgebung**: Katalog der fünf Repos, Git- und make-Operationen, Modul-Graph.
+`CanonicalReference` is the Python name of Go's `reference.Canonical` interface.
+The plain name is taken by the semver function `Canonical`, which keeps its Go name.
 
-Verwendete Design Patterns:
+## Python versions
 
-| Pattern    | Wo                                                                 |
-|------------|--------------------------------------------------------------------|
-| Singleton  | `PodmanEnvironment.instance()`                                     |
-| Factory    | `RepoFactory` (Repo-Objekte), `make_formatter()` (Ausgabeformate)  |
-| Facade     | `PodmanEnvironment` verbirgt git, make und go.mod                  |
-| Command    | `PinSubmodule`, `LatestSubmodule`, `MakeTarget`, ausgeführt von `Invoker` |
-| Template   | `Operation.run()`: Start, Vorprüfung, Ausführung, Ergebnis         |
-| Observer   | `EventBus` mit `ConsoleObserver` und `RecordingObserver`           |
-| Strategy   | `TableFormatter`, `JsonFormatter`, `DotFormatter`                  |
-| Visitor    | `GoModuleScanner` besucht jedes Repo und liest seine go.mod-Dateien |
-
-## Semver-Port prüfen
-
-`check_semver_port.py` kopiert das vendorte `semver.go` in ein temporäres
-Go-Modul, baut einen kleinen Treiber und gibt beiden Implementierungen dieselben
-Eingaben. Verglichen werden IsValid, Canonical, Major, MajorMinor, Prerelease,
-Build, Compare, Max und die Sortierung. Ergebnis zum Zeitpunkt des Ports:
-0 Abweichungen bei 20.841 Paaren und identische Sortierung.
-
-## Hinweise
-
-- Getestet mit Python 3.13. Der Code ist für Python 2.7 geschrieben (kein
-  f-String, keine Typannotationen, `from __future__`-Importe), dort aber nicht
-  ausgeführt.
-- Die Go-Quellen der Repos bleiben unverändert. Python steuert sie über git und
-  make, es ersetzt keinen Go-Code.
+The code is written for Python 2.7 and 3.x: `from __future__` imports, no
+f-strings, no type annotations. It was run and tested on Python 3.13 only.

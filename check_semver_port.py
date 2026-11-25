@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 """Check the Python port (podmanlib, Part 1) against the Go original.
 
-Copies repos/podman/vendor/golang.org/x/mod/semver/semver.go into a temporary
-Go module, builds a small driver next to it, feeds the same random and
-hand-picked inputs to both implementations and compares every result.
+Copies vendor/golang.org/x/mod/semver/semver.go from a container-libs checkout
+(PODMAN_GO_REFERENCE) into a temporary Go module, builds a small driver next
+to it, feeds the same random and hand-picked inputs to both implementations
+and compares every result.
 
-    python check_semver_port.py [count]     default count: 20000
+    PODMAN_GO_REFERENCE=/path/to/container-libs python check_semver_port.py [count]
 
-Needs the go toolchain on PATH. Without it the script says so and exits 0.
+Needs the go toolchain on PATH. Exit status: 0 equal, 1 mismatches, 2 missing
+go or checkout.
 """
 from __future__ import print_function
 
@@ -94,8 +96,8 @@ EDGE = ["", "v", "v1", "v1.2", "v1.2.3", "v01.2.3", "v1.02.3", "v1.2.03", "v1.2.
 
 
 def semver_go_path():
-    return os.path.join(podmanlib.ROOT, "repos", "podman", "vendor",
-                        "golang.org", "x", "mod", "semver", "semver.go")
+    ref_dir = os.environ.get("PODMAN_GO_REFERENCE", "")
+    return os.path.join(ref_dir, "vendor", "golang.org", "x", "mod", "semver", "semver.go")
 
 
 def build_driver(workdir):
