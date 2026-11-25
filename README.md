@@ -40,6 +40,8 @@ Not yet ported:
 | `buildah.py`                   | Command line: `buildah` (version; image build is out of scope) |
 | `podman_machine_os.py`         | Command line: `podman-machine-os` (version; the rest not implemented) |
 | `test_cli.py`                  | Tests of the command line programs |
+| `oci_run.py`                   | Runs one command in a rootfs with crun (or runc) through a minimal OCI bundle |
+| `test_oci.py`                  | Tests of the runtime choice and the spec |
 | `test_engine.py`               | Tests of the remote commands against a fake libpod service on a unix socket |
 | `test_podmanlib.py`            | Unit tests |
 | `.github/workflows/ci.yml`     | CI: lint, unit tests on several Python versions, a Python 2.7 run, and the cross-checks |
@@ -105,6 +107,22 @@ Tested live against podman 4.9.3 in a qbox aarch64 box, through the box's forwar
 the path (`/v4.9.0/libpod/...`); the client reads it from `/version`.
 Interactive runs (`-i`, `-t`) and attaching to a running container are not supported yet; use `-d` for
 services. The API is the one of the podman service in the box, so the container itself runs there.
+
+## OCI runtime (crun first, runc second)
+
+`podmanlib.py` (Part 9) calls the OCI runtime program, in podman's order: `crun` (C) first, then `runc`
+(Go). It builds a minimal `config.json` and runs a command in a root filesystem:
+
+```bash
+PMPY_RUNTIME=/usr/bin/crun python3 oci_run.py /path/to/rootfs uname -m
+```
+
+Tested in a qbox box (Ubuntu 24.04, crun 1.14.1, cgroup v2): `uname -m` prints `aarch64`, output and
+exit status are passed through. The rootfs in the test came from an alpine export; pulling images
+is not ported yet.
+
+Limits: the spec has pid, ipc, uts and mount namespaces only, so the container shares the host's network;
+no cgroup limits, no volumes or ports, no detached containers yet.
 
 ## Usage
 

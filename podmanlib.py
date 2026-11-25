@@ -12,6 +12,7 @@ Ported so far
   Part 4  container-libs image/docker/reference     (image name parsing)
   Part 6  image manifests: media types, digest, the platform of this machine,
           choosing an image from an OCI index or a Docker manifest list
+  Part 9  OCI runtime: crun first, runc second; spec and bundle; calls the runtime program
   Part 7  command line helpers: flags without argparse, exit status, not-implemented
   Part 8  container engine client: libpod REST API over a unix socket, output formats
   Part 5  machine connections: pkg/machine/connection and common/pkg/config
@@ -2181,6 +2182,128 @@ def format_template(template, obj):
         return str(value)
     text = _TEMPLATE_FIELD.sub(field, template)
     return text.replace("\\t", "\t").replace("\\n", "\n")
+
+
+# ===========================================================================
+# Part 9: OCI runtime. Go: podman gives a bundle (config.json and a rootfs) to an
+#         OCI runtime. The runtime is found in podman's order: crun (C) first,
+#         then runc (Go). This part only calls the runtime program; it does not
+#         replace it. Spec generation is minimal: pid, ipc, uts and mount
+#         namespaces, the default capability set, /proc, /dev, /dev/pts, /sys.
+# ===========================================================================
+
+OCI_RUNTIME_ORDER = ("crun", "runc")  # podman's default, see common/pkg/config/default.go
+OCI_SPEC_VERSION = "1.0.2"
+OCI_DEFAULT_ENV = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                   "TERM=xterm"]
+OCI_DEFAULT_CAPABILITIES = [
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD",
+    "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP",
+    "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE",
+]
+
+
+class OCIRuntimeError(RuntimeError):
+    """The runtime program failed. str() has its stderr, or the status."""
+
+
+def find_executable(name, search_path=None):
+    """The full path of an executable on the search path, or None."""
+    if search_path is None:
+        search_path = os.environ.get("PATH", "")
+    for directory in search_path.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def find_oci_runtime(search_path=None, order=OCI_RUNTIME_ORDER):
+    """crun if it is installed, else runc, else None: the order podman uses."""
+    for name in order:
+        path = find_executable(name, search_path)
+        if path is not None:
+            return path
+    return None
+
+
+def make_spec(args, env=None, cwd="/", hostname="pmpy", capabilities=None):
+    """A minimal OCI runtime spec (config.json) for a process in ./rootfs."""
+    caps = list(OCI_DEFAULT_CAPABILITIES if capabilities is None else capabilities)
+    return {
+        "ociVersion": OCI_SPEC_VERSION,
+        "process": {
+            "terminal": False,
+            "user": {"uid": 0, "gid": 0},
+            "args": list(args),
+            "env": list(OCI_DEFAULT_ENV if env is None else env),
+            "cwd": cwd,
+            "noNewPrivileges": True,
+            "capabilities": {"bounding": caps, "effective": caps, "permitted": caps,
+                             "inheritable": [], "ambient": []},
+        },
+        "root": {"path": "rootfs", "readonly": False},
+        "hostname": hostname,
+        "mounts": [
+            {"destination": "/proc", "type": "proc", "source": "proc"},
+            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+             "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+            {"destination": "/dev/pts", "type": "devpts", "source": "devpts",
+             "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]},
+            {"destination": "/sys", "type": "sysfs", "source": "sysfs",
+             "options": ["nosuid", "noexec", "nodev", "ro"]},
+        ],
+        "linux": {"namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
+                                 {"type": "mount"}]},
+    }
+
+
+def write_bundle(bundle_dir, spec):
+    """Writes config.json into the bundle directory. The rootfs must already be in place."""
+    if not os.path.isdir(bundle_dir):
+        os.makedirs(bundle_dir)
+    with io.open(os.path.join(bundle_dir, "config.json"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+    return bundle_dir
+
+
+class OCIRuntime(object):
+    """The runtime program, called the way podman calls it (create, start, state, kill, delete)."""
+
+    def __init__(self, path=None):
+        self.path = path or find_oci_runtime()
+        if self.path is None:
+            raise OCIRuntimeError("no OCI runtime found (install crun or runc)")
+
+    def _call(self, args, cwd=None):
+        result = run([self.path] + list(args), cwd=cwd)
+        if not result.ok:
+            raise OCIRuntimeError("%s %s: %s" % (os.path.basename(self.path), args[0],
+                                                 result.stderr.strip() or result.returncode))
+        return result
+
+    def create(self, container_id, bundle):
+        self._call(["create", "--bundle", bundle, container_id])
+
+    def start(self, container_id):
+        self._call(["start", container_id])
+
+    def state(self, container_id):
+        return json.loads(self._call(["state", container_id]).stdout)
+
+    def kill(self, container_id, signal="TERM"):
+        self._call(["kill", container_id, signal])
+
+    def delete(self, container_id, force=False):
+        args = ["delete"] + (["--force"] if force else []) + [container_id]
+        self._call(args)
+
+    def run(self, container_id, bundle):
+        """create, start and wait in one call. Returns (exit status, stdout, stderr)."""
+        result = run([self.path, "run", "--bundle", bundle, container_id])
+        return result.returncode, result.stdout, result.stderr
 
 
 # ===========================================================================

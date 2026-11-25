@@ -42,6 +42,8 @@ jobs:
         run: python test_cli.py
       - name: engine client tests (fake libpod service)
         run: python test_engine.py
+      - name: OCI runtime tests (no root needed)
+        run: python test_oci.py
       - name: image reference CLI
         run: python image_reference.py alpine:3.20 Ubuntu
       - name: machine connections CLI on a temporary file
@@ -64,6 +66,7 @@ jobs:
       - run: python test_podmanlib.py
       - run: python test_cli.py
       - run: python test_engine.py
+      - run: python test_oci.py
 
   crosscheck:
     name: cross-check against the Go originals
