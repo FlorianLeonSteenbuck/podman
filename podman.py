@@ -44,7 +44,8 @@ LOCAL = {
 }
 
 REMOTE = ("ps", "images", "pull", "image exists", "inspect", "start", "stop", "restart",
-          "rm", "rmi", "logs", "version", "run")
+          "rm", "rmi", "logs", "version", "run", "pod create", "pod ps", "pod start",
+          "pod stop", "pod rm")
 
 NOT_IMPLEMENTED = {
     "create": "tier 2, run a container",
@@ -417,18 +418,32 @@ def cmd_rmi(client, args):
     return pl.EXIT_OK
 
 
-def write_frames(data):
-    """Stdout frames go to stdout, stderr frames to stderr, as podman logs does."""
-    for stream, payload in pl.demux_frames(data):
+def write_stream(chunks):
+    """(stream, bytes) pairs to the terminal: stdout for 1, stderr for 2. The bytes are
+    written as they are, so a multi-byte character split across two chunks survives."""
+    for stream, payload in chunks:
+        sys.stdout.flush()
+        sys.stderr.flush()
         target = sys.stderr if stream == 2 else sys.stdout
-        target.write(payload.decode("utf-8", "replace"))
+        target = getattr(target, "buffer", target)
+        target.write(payload)
         target.flush()
 
 
+def write_frames(data):
+    """Stdout frames go to stdout, stderr frames to stderr, as podman logs does."""
+    write_stream(pl.demux_frames(data))
+
+
 def cmd_logs(client, args):
-    if len(args) != 1:
-        raise pl.CliUsageError("usage: podman logs NAME")
-    write_frames(client.container_logs(args[0]))
+    options, names = pl.take_flags(normalize_short(args, {"-f": "--follow"}),
+                                   {"--follow": "bool"})
+    if len(names) != 1:
+        raise pl.CliUsageError("usage: podman logs [-f] NAME")
+    if options.get("--follow", False):
+        write_stream(client.stream_logs(names[0], follow=True))
+    else:
+        write_frames(client.container_logs(names[0]))
     return pl.EXIT_OK
 
 
@@ -445,9 +460,10 @@ def cmd_version_remote(client, args):
 
 
 def parse_run(args):
-    """podman run [-d] [--rm] [--name N] [-e K=V] [-p H:C] [-v H:C[:ro]] [-w DIR] IMAGE [CMD...]"""
+    """podman run [-d] [--rm] [--name N] [-e K=V] [-p H:C] [-v H:C[:ro]] [-w DIR]
+    [--pod P] [--restart POLICY] [--network host|none] IMAGE [CMD...]"""
     spec = {"detach": False, "rm": False, "name": None, "env": {}, "ports": [],
-            "volumes": [], "workdir": None}
+            "volumes": [], "workdir": None, "pod": None, "restart": None, "network": None}
     i = 0
     while i < len(args) and args[i].startswith("-"):
         arg = args[i]
@@ -455,13 +471,20 @@ def parse_run(args):
             spec["detach"] = True
         elif arg == "--rm":
             spec["rm"] = True
-        elif arg in ("--name", "-e", "--env", "-p", "--publish", "-v", "--volume", "-w", "--workdir"):
+        elif arg in ("--name", "-e", "--env", "-p", "--publish", "-v", "--volume", "-w", "--workdir",
+                     "--pod", "--restart", "--network"):
             if i + 1 >= len(args):
                 raise pl.CliUsageError("%s needs a value" % arg)
             i += 1
             value = args[i]
             if arg == "--name":
                 spec["name"] = value
+            elif arg == "--pod":
+                spec["pod"] = value
+            elif arg == "--restart":
+                spec["restart"] = value
+            elif arg == "--network":
+                spec["network"] = value
             elif arg in ("-e", "--env"):
                 if "=" in value:
                     key, _, val = value.partition("=")
@@ -517,18 +540,96 @@ def cmd_run(client, args):
     body = {"image": spec["image"], "command": spec["command"] or None,
             "name": spec["name"], "env": spec["env"] or None,
             "portmappings": spec["ports"] or None, "mounts": spec["volumes"] or None,
-            "work_dir": spec["workdir"]}
+            "work_dir": spec["workdir"], "pod": spec["pod"], "network": spec["network"],
+            "restart_policy": spec["restart"]}
     body = dict((k, v) for k, v in body.items() if v is not None)
     container = client.create_container(body)
     client.container_action(container, "start")
     if spec["detach"]:
         sys.stdout.write(container + "\n")
         return pl.EXIT_OK
+    # attached: the output comes while the container runs, then its exit status
+    write_stream(client.stream_logs(container, follow=True))
     code = client.wait_container(container, "stopped")
-    write_frames(client.container_logs(container))
     if spec["rm"]:
         client.remove_container(container, force=True)
     return code
+
+
+def parse_pod_create(args):
+    """podman pod create [--name N] [-p H:C]..."""
+    spec = {"name": None, "ports": []}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--name", "-p", "--publish"):
+            if i + 1 >= len(args):
+                raise pl.CliUsageError("%s needs a value" % arg)
+            i += 1
+            if arg == "--name":
+                spec["name"] = args[i]
+            else:
+                spec["ports"].append(publish_entry(args[i]))
+        else:
+            raise pl.CliUsageError("unsupported pod create option %s" % arg)
+        i += 1
+    return spec
+
+
+def cmd_pod_create(client, args):
+    spec = parse_pod_create(args)
+    body = {"name": spec["name"], "portmappings": spec["ports"] or None}
+    body = dict((k, v) for k, v in body.items() if v is not None)
+    sys.stdout.write(client.create_pod(body) + "\n")
+    return pl.EXIT_OK
+
+
+def pod_view(item):
+    """The fields of one pod, under the names podman uses in --format."""
+    containers = item.get("Containers") or []
+    return {
+        "ID": item.get("Id", ""),
+        "Name": item.get("Name", ""),
+        "Status": item.get("Status", ""),
+        "Created": pl.time_ago(pl.epoch_of(item.get("Created"))),
+        "NumberOfContainers": str(len(containers)),
+        "Ports": ports_text(item.get("Ports")),
+    }
+
+
+def cmd_pod_ps(client, args):
+    options, _ = pl.take_flags(args, {"--format": "value"})
+    views = [pod_view(item) for item in client.list_pods()]
+    if "--format" in options:
+        for view in views:
+            sys.stdout.write(pl.format_template(options["--format"], view) + "\n")
+    else:
+        headers = ["POD ID", "NAME", "STATUS", "CREATED", "# OF CONTAINERS", "PORTS"]
+        table = [[v["ID"][:12], v["Name"], v["Status"], v["Created"],
+                  v["NumberOfContainers"], v["Ports"]] for v in views]
+        sys.stdout.write(pl.format_table(headers, table))
+    return pl.EXIT_OK
+
+
+def cmd_pod_action(action):
+    def run(client, args):
+        options, names = pl.take_flags(normalize_short(args, {"-t": "--time"}),
+                                       {"--time": "value"})
+        for name in names_of(names, "usage: podman pod %s NAME..." % action):
+            query = {"timeout": options["--time"]} if "--time" in options else None
+            client.pod_action(name, action, query)
+            sys.stdout.write(name + "\n")
+        return pl.EXIT_OK
+    return run
+
+
+def cmd_pod_rm(client, args):
+    options, names = pl.take_flags(normalize_short(args, {"-f": "--force"}),
+                                   {"--force": "bool"})
+    for name in names_of(names, "usage: podman pod rm [-f] NAME..."):
+        client.remove_pod(name, force=options.get("--force", False))
+        sys.stdout.write(name + "\n")
+    return pl.EXIT_OK
 
 
 REMOTE_FUNCTIONS = {
@@ -545,6 +646,11 @@ REMOTE_FUNCTIONS = {
     "rmi": cmd_rmi,
     "logs": cmd_logs,
     "version": cmd_version_remote,
+    "pod create": cmd_pod_create,
+    "pod ps": cmd_pod_ps,
+    "pod start": cmd_pod_action("start"),
+    "pod stop": cmd_pod_action("stop"),
+    "pod rm": cmd_pod_rm,
 }
 
 
@@ -563,7 +669,7 @@ def usage():
 
 
 def command_key(args):
-    if args[0] in ("image", "manifest", "machine", "system"):
+    if args[0] in ("image", "manifest", "machine", "system", "pod"):
         return " ".join(args[:2]), args[2:]
     return args[0], args[1:]
 

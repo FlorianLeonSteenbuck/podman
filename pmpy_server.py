@@ -10,7 +10,9 @@ Options: --home DIR     state and rootfs store (default $PMPY_HOME, /var/lib/pmp
                         else ~/.local/share/pmpy)
          --runtime PATH OCI runtime (default: crun, then runc)
 
-What it does not do yet: pull, networking, ports, pods, restart, attach. Those answer 501.
+Containers: host (default) or none networking; published tcp ports; pods; restart policies
+(no, on-failure[:N], always, unless-stopped); logs -f. Not yet: image pull, bridge networking,
+udp ports, stdin. Those answer 501.
 Exit status: 0 ok, 1 error, 2 usage.
 """
 from __future__ import print_function
@@ -52,6 +54,8 @@ def main(argv=None):
                 sys.stdout.write("%s\t%s\n" % (ref, image["Id"][:12]))
             return pl.EXIT_OK
         if command == "serve" and len(rest) == 1:
+            for name, message in engine.resume():
+                sys.stderr.write("pmpy: could not restart %s: %s\n" % (name, message))
             server = pl.EngineUnixServer(os.path.abspath(rest[0]), engine)
             sys.stderr.write("pmpy engine listening on %s (home %s)\n" % (rest[0], home))
             try:

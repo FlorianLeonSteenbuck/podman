@@ -48,6 +48,7 @@ import subprocess
 import sys
 import socket
 import socketserver
+import struct
 import tempfile
 import threading
 import time
@@ -2093,6 +2094,67 @@ class EngineClient(object):
                             {"stdout": True, "stderr": True})
         return data
 
+    def stream_logs(self, name, follow=False):
+        """Yields (stream, bytes) as the container writes them. With follow, the generator
+        ends when the container has stopped; without it, after the output so far."""
+        path = "%s/libpod/containers/%s/logs?%s" % (
+            self.prefix(), url_quote(name, safe=""),
+            urlencode([("stdout", "true"), ("stderr", "true"),
+                       ("follow", "true" if follow else "false")]))
+        conn = UnixHTTPConnection(self.socket_path, None)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            if response.status != 200:
+                raise EngineError(response.status,
+                                  _error_message(response.read(), response.status))
+            while True:
+                header = _read_exact(response, 8)
+                if len(header) < 8:
+                    return
+                head = bytearray(header)
+                size = (head[4] << 24) | (head[5] << 16) | (head[6] << 8) | head[7]
+                payload = _read_exact(response, size)
+                yield head[0], payload
+                if len(payload) < size:
+                    return
+        except (socket.error, OSError, httpclient.HTTPException) as exc:
+            raise EngineError(0, "cannot reach %s: %s" % (self.socket_path, exc))
+        finally:
+            conn.close()
+
+    def create_pod(self, spec):
+        """POST /libpod/pods/create. Returns the pod id."""
+        _, data = self.call("POST", "/libpod/pods/create", None, expect=(200, 201), body=spec)
+        return json.loads(data.decode("utf-8", "replace"))["Id"]
+
+    def list_pods(self):
+        return self.get_json("/libpod/pods/json") or []
+
+    def inspect_pod(self, name):
+        return self.get_json("/libpod/pods/%s/json" % url_quote(name, safe=""))
+
+    def pod_action(self, name, action, query=None):
+        """start or stop."""
+        self.call("POST", "/libpod/pods/%s/%s" % (url_quote(name, safe=""), action),
+                  query, expect=(200, 204, 304))
+
+    def remove_pod(self, name, force=False):
+        _, data = self.call("DELETE", "/libpod/pods/%s" % url_quote(name, safe=""),
+                            {"force": force}, expect=(200,))
+        return json.loads(data.decode("utf-8", "replace")) if data else {}
+
+
+def _read_exact(stream, count):
+    """Reads count bytes, or fewer if the stream ends first."""
+    data = b""
+    while len(data) < count:
+        chunk = stream.read(count - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
 
 def demux_frames(data):
     """Log frames of a container without a tty: an 8-byte header (stream, 0, 0, 0, size as
@@ -2237,9 +2299,17 @@ def find_oci_runtime(search_path=None, order=OCI_RUNTIME_ORDER):
     return None
 
 
-def make_spec(args, env=None, cwd="/", hostname="pmpy", capabilities=None):
-    """A minimal OCI runtime spec (config.json) for a process in ./rootfs."""
+def make_spec(args, env=None, cwd="/", hostname="pmpy", capabilities=None, network="host"):
+    """A minimal OCI runtime spec (config.json) for a process in ./rootfs.
+
+    network "host" shares the host network namespace; "none" gives the process an empty
+    one (loopback only)."""
+    if network not in ("host", "none"):
+        raise ValueError("unknown network mode %s" % network)
     caps = list(OCI_DEFAULT_CAPABILITIES if capabilities is None else capabilities)
+    namespaces = [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]
+    if network == "none":
+        namespaces.append({"type": "network"})
     return {
         "ociVersion": OCI_SPEC_VERSION,
         "process": {
@@ -2263,8 +2333,7 @@ def make_spec(args, env=None, cwd="/", hostname="pmpy", capabilities=None):
             {"destination": "/sys", "type": "sysfs", "source": "sysfs",
              "options": ["nosuid", "noexec", "nodev", "ro"]},
         ],
-        "linux": {"namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
-                                 {"type": "mount"}]},
+        "linux": {"namespaces": namespaces},
     }
 
 
@@ -2308,6 +2377,11 @@ class OCIRuntime(object):
         args = ["delete"] + (["--force"] if force else []) + [container_id]
         self._call(args)
 
+    def spawn(self, container_id, bundle, stdout, stderr):
+        """Starts the container in the background; stdout and stderr are open files."""
+        return subprocess.Popen([self.path, "run", "--bundle", bundle, container_id],
+                                stdout=stdout, stderr=stderr)
+
     def run(self, container_id, bundle):
         """create, start and wait in one call. Returns (exit status, stdout, stderr)."""
         result = run([self.path, "run", "--bundle", bundle, container_id])
@@ -2315,18 +2389,27 @@ class OCIRuntime(object):
 
 
 # ===========================================================================
-# Part 10: a small engine server. It serves the part of the libpod REST API that
-#          podman.py uses, on a unix socket: containers (create, start, wait, stop,
-#          logs, inspect, list, delete) and images from a local rootfs store.
-#          Containers run through the OCI runtime of part 9. Everything else answers
-#          501 (not implemented). No pull, no networking, no pods, no restart. The
-#          state is one JSON file; containers that were running when the server
-#          stopped are reported as exited.
+# Part 10: an engine server. It serves the part of the libpod REST API that
+#          podman.py uses, on a unix socket: containers, pods and images from a
+#          local rootfs store. Containers run through the OCI runtime of part 9,
+#          one supervisor thread per running container applies its restart policy,
+#          and published ports are forwarded on the host by PortForwarder.
+#          Networking: host (the default) and none. Pod members share the host
+#          network. Not here: bridge networking, image pulls, exec, stdin, udp.
+#          Everything else answers 501. The state is one JSON file. Containers that
+#          were running when the server stopped are reported as exited; resume()
+#          starts those again if their restart policy says so.
 # ===========================================================================
 
 ENGINE_API_VERSION = "4.9.0"
 ENGINE_VERSION = "0.1.0-pmpy"
 ENGINE_STOP_TIMEOUT = 10
+ENGINE_NETWORKS = ("host", "none")
+ENGINE_RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
+ENGINE_BACKOFF_FIRST = 0.1  # seconds before the first restart; doubles on each restart
+ENGINE_BACKOFF_MAX = 30.0
+ENGINE_FOLLOW_INTERVAL = 0.05
+ENGINE_CHUNK = 65536
 
 
 class ServerError(Exception):
@@ -2362,29 +2445,167 @@ def directory_size(path):
     return total
 
 
+def frame(stream, payload):
+    """One log frame in the raw stream format: stream, 0, 0, 0, size (big-endian uint32), payload."""
+    return struct.pack(">BxxxI", stream, len(payload)) + payload
+
+
+def parse_restart(policy, retries=None):
+    """A restart policy as podman spells it: no, always, unless-stopped, on-failure or
+    on-failure:N. Returns (name, retries)."""
+    text = (policy or "no").strip().lower()
+    name, _, count = text.partition(":")
+    if name not in ENGINE_RESTART_POLICIES:
+        raise ServerError(400, "unknown restart policy %s" % text)
+    if count:
+        if name != "on-failure":
+            raise ServerError(400, "only on-failure takes a retry count")
+        retries = count
+    retries = int(retries or 0)
+    if retries < 0:
+        raise ServerError(400, "the retry count must not be negative")
+    return name, retries
+
+
+def normalize_ports(items):
+    """Podman's portmappings, one entry per port (a range is expanded). Only tcp is supported."""
+    out = []
+    for item in items or []:
+        protocol = (item.get("protocol") or "tcp").lower()
+        if protocol != "tcp":
+            raise ServerError(501, "pmpy publishes only tcp ports, not %s" % protocol)
+        count = int(item.get("range") or 1)
+        container_port = int(item["container_port"])
+        host_port = int(item.get("host_port") or container_port)
+        if (count < 1 or container_port < 1 or host_port < 1
+                or container_port + count - 1 > 65535 or host_port + count - 1 > 65535):
+            raise ServerError(400, "bad port mapping %d:%d" % (host_port, container_port))
+        for i in range(count):
+            out.append({"container_port": container_port + i, "host_port": host_port + i,
+                        "host_ip": item.get("host_ip") or "", "protocol": "tcp"})
+    return out
+
+
+def read_from(path, offset):
+    """The output of a log file after offset, and the new offset. A file that became
+    shorter (the container was started again and its log truncated) is read from the start."""
+    if not os.path.exists(path):
+        return offset, b""
+    with io.open(path, "rb") as fh:
+        fh.seek(0, 2)
+        if fh.tell() < offset:
+            offset = 0
+        fh.seek(offset)
+        payload = fh.read(ENGINE_CHUNK)
+    return offset + len(payload), payload
+
+
+def _copy_stream(src, dst):
+    try:
+        while True:
+            data = src.recv(ENGINE_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except socket.error:
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except socket.error:
+        pass
+
+
+class PortForwarder(object):
+    """Accepts TCP on host_ip:host_port and copies every connection to 127.0.0.1:container_port.
+
+    This is how a published port works here. A container in host networking shares the
+    host's network namespace, so its port is reachable on loopback."""
+
+    def __init__(self, host_ip, host_port, container_port):
+        self.host_port = host_port
+        self.container_port = container_port
+        self.closed = False
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((host_ip or "0.0.0.0", host_port))
+        except socket.error:
+            self.sock.close()
+            raise
+        self.sock.listen(64)
+        self.sock.settimeout(0.5)
+        self.thread = threading.Thread(target=self._accept)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _accept(self):
+        while not self.closed:
+            try:
+                client, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except socket.error:
+                break
+            worker = threading.Thread(target=self._pipe, args=(client,))
+            worker.daemon = True
+            worker.start()
+
+    def _pipe(self, client):
+        client.settimeout(None)
+        try:
+            target = socket.create_connection(("127.0.0.1", self.container_port), 5)
+        except socket.error:
+            client.close()
+            return
+        target.settimeout(None)
+        back = threading.Thread(target=_copy_stream, args=(target, client))
+        back.daemon = True
+        back.start()
+        _copy_stream(client, target)
+        back.join()
+        client.close()
+        target.close()
+
+    def close(self):
+        self.closed = True
+        try:
+            self.sock.close()
+        except socket.error:
+            pass
+
+
 class EngineServer(object):
-    """Containers and images in one JSON state file under home, run through an OCI runtime."""
+    """Containers, pods and images in one JSON state file under home, run through an OCI runtime."""
 
     def __init__(self, home, runtime_path=None):
         self.home = os.path.abspath(home)
         self.runtime_path = runtime_path
         self._runtime = None
         self.lock = threading.RLock()
-        self.done = {}  # container id -> Event, for containers this process started
+        self.done = {}      # container id -> Event, set when its supervisor has finished
+        self.procs = {}     # container id -> Popen of the running OCI runtime
+        self.wake = {}      # container id -> Event that cuts a restart delay short
+        self.forwards = {}  # container or pod id -> [PortForwarder]
         for sub in ("bundles", "logs", "rootfs"):
             path = os.path.join(self.home, sub)
             if not os.path.isdir(path):
                 os.makedirs(path)
         self.state_path = os.path.join(self.home, "state.json")
-        self.state = {"containers": {}, "images": {}}
+        self.state = {"containers": {}, "images": {}, "pods": {}}
         if os.path.exists(self.state_path):
             with io.open(self.state_path, encoding="utf-8") as fh:
                 self.state = json.loads(fh.read())
+        self.state.setdefault("pods", {})
+        now = time.time()
         for c in self.state["containers"].values():
+            c.setdefault("network", "host")
+            c.setdefault("pod", "")
+            c.setdefault("restart", {"policy": "no", "retries": 0})
+            c.setdefault("restart_count", 0)
+            c.setdefault("stop_requested", False)
+            c.setdefault("interrupted", False)
             if c["status"] == "running":
-                c["status"] = "exited"
-                c["exit_code"] = -1
-                c["finished"] = time.time()
+                c.update(status="exited", exit_code=-1, finished=now, interrupted=True)
         self._save()
 
     # --- state file ------------------------------------------------------------
@@ -2402,6 +2623,25 @@ class EngineServer(object):
             except OCIRuntimeError as exc:
                 raise ServerError(500, str(exc))
         return self._runtime
+
+    # --- ports -----------------------------------------------------------------
+
+    def _publish(self, owner, mappings):
+        """Opens the host ports of a container or pod. Called with the lock held."""
+        forwarders = []
+        for mapping in mappings:
+            try:
+                forwarders.append(PortForwarder(mapping["host_ip"], mapping["host_port"],
+                                                mapping["container_port"]))
+            except socket.error as exc:
+                for forwarder in forwarders:
+                    forwarder.close()
+                raise ServerError(500, "cannot publish port %d: %s" % (mapping["host_port"], exc))
+        self.forwards[owner] = forwarders
+
+    def _unpublish(self, owner):
+        for forwarder in self.forwards.pop(owner, []):
+            forwarder.close()
 
     # --- images ----------------------------------------------------------------
 
@@ -2435,6 +2675,90 @@ class EngineServer(object):
             raise ServerError(404, "image not known")
         return ref, image
 
+    # --- pods ------------------------------------------------------------------
+
+    def _pod(self, key):
+        pods = self.state["pods"]
+        if key in pods:
+            return pods[key]
+        for pod in pods.values():
+            if pod["name"] == key:
+                return pod
+        matches = [p for pid, p in pods.items() if len(key) >= 4 and pid.startswith(key)]
+        if len(matches) == 1:
+            return matches[0]
+        raise ServerError(404, "no pod with name or ID %s found: no such pod" % key)
+
+    def _members(self, pod):
+        return sorted((c for c in self.state["containers"].values() if c["pod"] == pod["id"]),
+                      key=lambda c: c["name"])
+
+    def _pod_name(self, c):
+        pod = self.state["pods"].get(c["pod"]) if c["pod"] else None
+        return pod["name"] if pod else ""
+
+    def pod_status(self, pod):
+        states = [c["status"] for c in self._members(pod)]
+        if "running" in states:
+            return "Running"
+        if "exited" in states:
+            return "Exited"
+        return "Created"
+
+    def pod_json(self, pod):
+        return {
+            "Id": pod["id"], "Name": pod["name"], "Status": self.pod_status(pod),
+            "Created": rfc3339(pod["created"]), "InfraId": "", "Labels": None,
+            "Containers": [{"Id": c["id"], "Names": [c["name"]], "Status": c["status"]}
+                           for c in self._members(pod)],
+            "Ports": pod["ports"], "Networks": [],
+        }
+
+    def pod_create(self, spec):
+        name = spec.get("name") or ""
+        network = spec.get("network") or "host"
+        if network != "host":
+            raise ServerError(501, "pmpy pods share the host network only")
+        ports = normalize_ports(spec.get("portmappings"))
+        with self.lock:
+            pid = new_container_id()
+            name = name or pid[:12]
+            if any(p["name"] == name for p in self.state["pods"].values()):
+                raise ServerError(409, "the name %s is already in use" % name)
+            self.state["pods"][pid] = {"id": pid, "name": name, "created": time.time(),
+                                       "ports": ports}
+            self._save()
+        return pid
+
+    def pod_start(self, key):
+        pod = self._pod(key)
+        with self.lock:
+            if pod["ports"] and pod["id"] not in self.forwards:
+                self._publish(pod["id"], pod["ports"])
+        for c in self._members(pod):
+            if c["status"] in ("created", "exited"):
+                self.start(c["id"])
+
+    def pod_stop(self, key, timeout):
+        pod = self._pod(key)
+        for c in self._members(pod):
+            self.stop(c["id"], timeout)
+        with self.lock:
+            self._unpublish(pod["id"])
+
+    def pod_remove(self, key, force):
+        pod = self._pod(key)
+        members = self._members(pod)
+        if not force and any(c["status"] == "running" for c in members):
+            raise ServerError(409, "pod %s has running containers; use force" % pod["name"])
+        for c in members:
+            self.delete(c["id"], True)
+        with self.lock:
+            self._unpublish(pod["id"])
+            del self.state["pods"][pod["id"]]
+            self._save()
+        return [c["id"] for c in members]
+
     # --- containers ------------------------------------------------------------
 
     def _container(self, key):
@@ -2449,6 +2773,11 @@ class EngineServer(object):
             return matches[0]
         raise ServerError(404, "no container with name or ID %s found: no such container" % key)
 
+    def _ports_of(self, c):
+        if c["pod"] and c["pod"] in self.state["pods"]:
+            return self.state["pods"][c["pod"]]["ports"]
+        return c["ports"]
+
     def container_json(self, c):
         return {
             "Id": c["id"], "Name": c["name"], "Image": c["image"],
@@ -2457,7 +2786,10 @@ class EngineServer(object):
             "State": {"Status": c["status"], "Running": c["status"] == "running",
                       "ExitCode": c["exit_code"], "StartedAt": rfc3339(c["started"]),
                       "FinishedAt": rfc3339(c["finished"]), "Pid": 0},
-            "Mounts": c["mounts"],
+            "Mounts": c["mounts"], "Pod": c["pod"], "RestartCount": c["restart_count"],
+            "HostConfig": {"NetworkMode": c["network"],
+                           "RestartPolicy": {"Name": c["restart"]["policy"],
+                                             "MaximumRetryCount": c["restart"]["retries"]}},
         }
 
     def list_entry(self, c):
@@ -2466,8 +2798,8 @@ class EngineServer(object):
             "Created": rfc3339(c["created"]), "State": c["status"], "Status": "",
             "StartedAt": int(c["started"] or 0), "ExitedAt": int(c["finished"] or 0),
             "ExitCode": c["exit_code"], "Exited": c["status"] == "exited",
-            "Ports": [dict(p, host_ip=p.get("host_ip", "")) for p in c["ports"]],
-            "PodName": "", "Labels": None,
+            "Ports": [dict(p, host_ip=p.get("host_ip", "")) for p in self._ports_of(c)],
+            "PodName": self._pod_name(c), "Labels": None,
         }
 
     def create(self, spec):
@@ -2475,11 +2807,22 @@ class EngineServer(object):
         command = list(spec.get("command") or [])
         if not command:
             raise ServerError(400, "pmpy needs an explicit command (images have no default yet)")
-        name = spec.get("name") or ""
+        network = spec.get("network") or "host"
+        if network not in ENGINE_NETWORKS:
+            raise ServerError(501, "pmpy does not implement network mode %s (host or none)" % network)
+        ports = normalize_ports(spec.get("portmappings"))
+        policy, retries = parse_restart(spec.get("restart_policy"), spec.get("restart_retries"))
         with self.lock:
+            pod = self._pod(spec["pod"]) if spec.get("pod") else None
+            if pod is not None:
+                if network != "host":
+                    raise ServerError(400, "a container in a pod uses the network of its pod")
+                if ports:
+                    raise ServerError(400, "publish the ports on the pod, not on a container in it")
+            elif ports and network == "none":
+                raise ServerError(400, "port publishing needs host networking, not none")
             cid = new_container_id()
-            if not name:
-                name = cid[:12]
+            name = spec.get("name") or cid[:12]
             if any(c["name"] == name for c in self.state["containers"].values()):
                 raise ServerError(409, "the name %s is already in use" % name)
             env = dict(item.split("=", 1) if "=" in item else (item, "") for item in OCI_DEFAULT_ENV)
@@ -2496,18 +2839,19 @@ class EngineServer(object):
             bundle = os.path.join(self.home, "bundles", cid)
             os.makedirs(bundle)
             os.symlink(image["rootfs"], os.path.join(bundle, "rootfs"))
-            oci = make_spec(command, env=env_list, cwd=work_dir, hostname=cid[:12])
+            oci = make_spec(command, env=env_list, cwd=work_dir, hostname=cid[:12], network=network)
             oci["mounts"].extend(mounts)
             write_bundle(bundle, oci)
-            ports = spec.get("portmappings") or []
             self.state["containers"][cid] = {
                 "id": cid, "name": name, "image": image_ref, "command": command,
                 "env": env_list, "work_dir": work_dir, "created": time.time(), "started": 0,
-                "finished": 0, "status": "created", "exit_code": 0, "ports": ports,
-                "mounts": mounts, "bundle": bundle}
+                "finished": 0, "status": "created", "exit_code": 0,
+                "ports": [] if pod is not None else ports, "mounts": mounts, "bundle": bundle,
+                "network": network, "pod": pod["id"] if pod is not None else "",
+                "restart": {"policy": policy, "retries": retries}, "restart_count": 0,
+                "stop_requested": False, "interrupted": False}
             self._save()
-        warnings = ["ports are not published by pmpy yet"] if ports else []
-        return cid, warnings
+        return cid, []
 
     def start(self, key):
         c = self._container(key)
@@ -2516,9 +2860,10 @@ class EngineServer(object):
                 return
             if c["status"] not in ("created", "exited"):
                 raise ServerError(409, "container %s cannot be started" % c["name"])
-            c["status"] = "running"
-            c["started"] = time.time()
-            c["finished"] = 0
+            if c["ports"] and not c["pod"]:
+                self._publish(c["id"], c["ports"])
+            c.update(status="running", started=time.time(), finished=0, restart_count=0,
+                     stop_requested=False, interrupted=False)
             event = threading.Event()
             self.done[c["id"]] = event
             self._save()
@@ -2526,29 +2871,104 @@ class EngineServer(object):
         thread.daemon = True
         thread.start()
 
+    def _should_restart(self, c, code):
+        policy = c["restart"]["policy"]
+        if policy in ("always", "unless-stopped"):
+            return True
+        if policy == "on-failure":
+            retries = c["restart"]["retries"]
+            return code != 0 and (retries == 0 or c["restart_count"] < retries)
+        return False
+
+    def _finish(self, c):
+        """The container has stopped for good. Called with the lock held."""
+        c["status"] = "exited"
+        if not c["pod"]:
+            self._unpublish(c["id"])
+
     def _run(self, cid, event):
-        c = self.state["containers"][cid]
-        code, out, err = self.runtime().run(cid, c["bundle"])
-        logs = os.path.join(self.home, "logs")
-        with io.open(os.path.join(logs, cid + ".stdout"), "wb") as fh:
-            fh.write(out.encode("utf-8") if not isinstance(out, bytes) else out)
-        with io.open(os.path.join(logs, cid + ".stderr"), "wb") as fh:
-            fh.write(err.encode("utf-8") if not isinstance(err, bytes) else err)
-        with self.lock:
-            c["status"] = "exited"
-            c["exit_code"] = code
-            c["finished"] = time.time()
-            self._save()
+        """The supervisor of one container: runs the OCI runtime and restarts it as its policy says."""
+        while True:
+            with self.lock:
+                c = self.state["containers"].get(cid)
+                if c is None:
+                    break
+                bundle = c["bundle"]
+            try:
+                self.runtime().delete(cid, force=True)  # left over from an earlier run, if any
+            except (OCIRuntimeError, ServerError):
+                pass
+            code = self._run_once(cid, bundle)
+            with self.lock:
+                c["exit_code"] = code
+                c["finished"] = time.time()
+                again = not c["stop_requested"] and self._should_restart(c, code)
+                if again:
+                    c["restart_count"] += 1
+                    delay = min(ENGINE_BACKOFF_FIRST * (2 ** (c["restart_count"] - 1)),
+                                ENGINE_BACKOFF_MAX)
+                    wake = threading.Event()
+                    self.wake[cid] = wake
+                else:
+                    self._finish(c)
+                self._save()
+            if not again:
+                break
+            wake.wait(delay)
+            with self.lock:
+                self.wake.pop(cid, None)
+                if c["stop_requested"]:
+                    self._finish(c)
+                    self._save()
+                    break
         event.set()
+
+    def _run_once(self, cid, bundle):
+        """One run of the OCI runtime, its output going to the log files. Returns the exit status."""
+        logs = os.path.join(self.home, "logs")
+        out = io.open(os.path.join(logs, cid + ".stdout"), "wb")
+        err = io.open(os.path.join(logs, cid + ".stderr"), "wb")
+        try:
+            try:
+                proc = self.runtime().spawn(cid, bundle, out, err)
+            except (OSError, ServerError) as exc:
+                err.write(("pmpy: cannot start the OCI runtime: %s\n" % exc).encode("utf-8"))
+                return 127
+            with self.lock:
+                self.procs[cid] = proc
+            code = proc.wait()
+            with self.lock:
+                self.procs.pop(cid, None)
+        finally:
+            out.close()
+            err.close()
+        if code < 0:  # killed by a signal: the shell convention, 128 + signal
+            code = 128 - code
+        return code
 
     def stop(self, key, timeout):
         c = self._container(key)
-        if c["status"] != "running":
+        cid = c["id"]
+        with self.lock:
+            if c["status"] != "running":
+                return
+            c["stop_requested"] = True
+            self._save()
+            event = self.done.get(cid)
+            wake = self.wake.get(cid)
+        if wake is not None:
+            wake.set()
+        if event is None:
             return
-        event = self.done.get(c["id"])
-        self.runtime().kill(c["id"], "TERM")
-        if event is not None and not event.wait(timeout):
-            self.runtime().kill(c["id"], "KILL")
+        try:
+            self.runtime().kill(cid, "TERM")
+        except (OCIRuntimeError, ServerError):
+            pass  # already gone, or waiting for a restart
+        if not event.wait(timeout):
+            try:
+                self.runtime().kill(cid, "KILL")
+            except (OCIRuntimeError, ServerError):
+                pass
             event.wait(ENGINE_STOP_TIMEOUT)
 
     def wait(self, key):
@@ -2558,28 +2978,45 @@ class EngineServer(object):
             event.wait()
         return c["exit_code"]
 
-    def logs(self, key):
+    def logs(self, key, follow=False):
+        """The output so far as frames. With follow, a generator of frames that ends when the
+        container has stopped. Unknown containers are an error here, before any output."""
         c = self._container(key)
-        frames = bytearray()
+        if follow:
+            return self._follow(c["id"])
+        out = []
         for stream, suffix in ((1, ".stdout"), (2, ".stderr")):
-            path = os.path.join(self.home, "logs", c["id"] + suffix)
-            if not os.path.exists(path):
-                continue
-            with io.open(path, "rb") as fh:
-                payload = fh.read()
-            size = len(payload)
-            frames.extend(bytearray([stream, 0, 0, 0, (size >> 24) & 255, (size >> 16) & 255,
-                                     (size >> 8) & 255, size & 255]))
-            frames.extend(payload)
-        return bytes(frames)
+            _, payload = read_from(os.path.join(self.home, "logs", c["id"] + suffix), 0)
+            if payload:
+                out.append(frame(stream, payload))
+        return b"".join(out)
+
+    def _follow(self, cid):
+        paths = {1: os.path.join(self.home, "logs", cid + ".stdout"),
+                 2: os.path.join(self.home, "logs", cid + ".stderr")}
+        offsets = {1: 0, 2: 0}
+        while True:
+            event = self.done.get(cid)
+            finished = event is None or event.is_set()
+            sent = False
+            for stream in (1, 2):
+                offsets[stream], payload = read_from(paths[stream], offsets[stream])
+                if payload:
+                    sent = True
+                    yield frame(stream, payload)
+            if finished and not sent:
+                return
+            if not sent:
+                time.sleep(ENGINE_FOLLOW_INTERVAL)
 
     def delete(self, key, force):
         c = self._container(key)
+        if c["status"] == "running":
+            if not force:
+                raise ServerError(409, "container %s is running; use force" % c["name"])
+            self.stop(c["id"], 0)
         with self.lock:
-            if c["status"] == "running":
-                if not force:
-                    raise ServerError(409, "container %s is running; use force" % c["name"])
-                self.stop(c["id"], 0)
+            self._unpublish(c["id"])
             shutil.rmtree(c["bundle"], ignore_errors=True)
             for suffix in (".stdout", ".stderr"):
                 path = os.path.join(self.home, "logs", c["id"] + suffix)
@@ -2588,10 +3025,29 @@ class EngineServer(object):
             del self.state["containers"][c["id"]]
             self._save()
 
+    def resume(self):
+        """After a restart of the server: starts again the containers that were running and
+        whose restart policy is always or unless-stopped. Returns (name, error) for failures."""
+        failed = []
+        with self.lock:
+            again = [c for c in self.state["containers"].values()
+                     if c["interrupted"] and c["restart"]["policy"] in ("always", "unless-stopped")
+                     and not c["stop_requested"]]
+            for c in self.state["containers"].values():
+                c["interrupted"] = False
+            self._save()
+        for c in again:
+            try:
+                self.start(c["id"])
+            except ServerError as exc:
+                failed.append((c["name"], exc.message))
+        return failed
+
     # --- HTTP answers ----------------------------------------------------------
 
     def handle(self, method, raw_path, body):
-        """Returns (status, content type, body bytes) for one request."""
+        """Returns (status, content type, body): bytes, or for a followed log an iterator of
+        byte chunks that the HTTP handler sends as they come."""
         path, _, query = raw_path.partition("?")
         path = re.sub(r"^/v[0-9][0-9.]*(?=/)", "", path)
         try:
@@ -2608,6 +3064,10 @@ class EngineServer(object):
             data = json.dumps({"cause": exc.message, "message": exc.message,
                                "response": exc.status}).encode("utf-8")
             return exc.status, "application/json", data
+        except OCIRuntimeError as exc:
+            data = json.dumps({"cause": str(exc), "message": str(exc),
+                               "response": 500}).encode("utf-8")
+            return 500, "application/json", data
         except (ValueError, KeyError, TypeError) as exc:
             data = json.dumps({"cause": str(exc), "message": str(exc),
                                "response": 400}).encode("utf-8")
@@ -2626,6 +3086,13 @@ class EngineServer(object):
             ("POST", r"^/libpod/containers/([^/]+)/wait$", self.h_wait),
             ("GET", r"^/libpod/containers/([^/]+)/logs$", self.h_logs),
             ("DELETE", r"^/libpod/containers/([^/]+)$", self.h_delete),
+            ("POST", r"^/libpod/pods/create$", self.h_pod_create),
+            ("GET", r"^/libpod/pods/json$", self.h_pod_list),
+            ("GET", r"^/libpod/pods/([^/]+)/exists$", self.h_pod_exists),
+            ("GET", r"^/libpod/pods/([^/]+)/json$", self.h_pod_inspect),
+            ("POST", r"^/libpod/pods/([^/]+)/start$", self.h_pod_start),
+            ("POST", r"^/libpod/pods/([^/]+)/stop$", self.h_pod_stop),
+            ("DELETE", r"^/libpod/pods/([^/]+)$", self.h_pod_delete),
             ("GET", r"^/libpod/images/json$", self.h_list_images),
             ("GET", r"^/libpod/images/([^/]+)/exists$", self.h_image_exists),
             ("GET", r"^/libpod/images/([^/]+)/json$", self.h_inspect_image),
@@ -2639,6 +3106,9 @@ class EngineServer(object):
     def _key(self, groups):
         return unquote(groups[0])
 
+    def _flag(self, query, name):
+        return name in query and query[name][0] in ("true", "1")
+
     def h_ping(self, groups, query, body):
         return 200, "text/plain", b"OK"
 
@@ -2650,7 +3120,7 @@ class EngineServer(object):
                                         "MinAPIVersion": ENGINE_API_VERSION}}]})
 
     def h_list_containers(self, groups, query, body):
-        everything = "all" in query and query["all"][0] not in ("false", "0")
+        everything = self._flag(query, "all")
         with self.lock:
             rows = [self.list_entry(c) for c in self.state["containers"].values()
                     if everything or c["status"] == "running"]
@@ -2677,12 +3147,44 @@ class EngineServer(object):
         return self._json(self.wait(self._key(groups)))
 
     def h_logs(self, groups, query, body):
-        return 200, "application/vnd.docker.raw-stream", self.logs(self._key(groups))
+        return 200, "application/vnd.docker.raw-stream", self.logs(self._key(groups),
+                                                                   self._flag(query, "follow"))
 
     def h_delete(self, groups, query, body):
-        force = "force" in query and query["force"][0] in ("true", "1")
-        self.delete(self._key(groups), force)
+        self.delete(self._key(groups), self._flag(query, "force"))
         return 204, "text/plain", b""
+
+    def h_pod_create(self, groups, query, body):
+        spec = json.loads(body.decode("utf-8")) if body else {}
+        return self._json({"Id": self.pod_create(spec)}, 201)
+
+    def h_pod_list(self, groups, query, body):
+        with self.lock:
+            rows = [self.pod_json(p) for p in self.state["pods"].values()]
+        return self._json(sorted(rows, key=lambda r: r["Name"]))
+
+    def h_pod_exists(self, groups, query, body):
+        try:
+            self._pod(self._key(groups))
+        except ServerError:
+            return 404, "text/plain", b""
+        return 204, "text/plain", b""
+
+    def h_pod_inspect(self, groups, query, body):
+        return self._json(self.pod_json(self._pod(self._key(groups))))
+
+    def h_pod_start(self, groups, query, body):
+        self.pod_start(self._key(groups))
+        return 204, "text/plain", b""
+
+    def h_pod_stop(self, groups, query, body):
+        timeout = int(query["timeout"][0]) if "timeout" in query else ENGINE_STOP_TIMEOUT
+        self.pod_stop(self._key(groups), timeout)
+        return 204, "text/plain", b""
+
+    def h_pod_delete(self, groups, query, body):
+        removed = self.pod_remove(self._key(groups), self._flag(query, "force"))
+        return self._json({"Id": self._key(groups), "Err": None, "RemovedContainers": removed})
 
     def h_list_images(self, groups, query, body):
         rows = []
@@ -2726,11 +3228,22 @@ class EngineHTTPHandler(BaseHTTPRequestHandler):
         status, content_type, data = self.server.engine.handle(self.command, self.path, body)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
         self.send_header("API-Version", ENGINE_API_VERSION)
+        if isinstance(data, bytes):
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if self.command != "HEAD" and data:
+                self.wfile.write(data)
+            return
+        # a stream (followed logs): no length; the connection closes when the stream ends
+        self.send_header("Connection", "close")
         self.end_headers()
-        if self.command != "HEAD" and data:
-            self.wfile.write(data)
+        try:
+            for chunk in data:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except socket.error:
+            pass  # the client went away
 
     do_GET = _answer
     do_POST = _answer
