@@ -13,6 +13,7 @@ Ported so far
   Part 6  image manifests: media types, digest, the platform of this machine,
           choosing an image from an OCI index or a Docker manifest list
   Part 7  command line helpers: flags without argparse, exit status, not-implemented
+  Part 8  container engine client: libpod REST API over a unix socket, output formats
   Part 5  machine connections: pkg/machine/connection and common/pkg/config
           connections.go (ssh:// connections of a VM, podman-connections.json)
 
@@ -43,8 +44,16 @@ import platform as hostplatform
 import re
 import subprocess
 import sys
+import socket
 import tempfile
 from collections import OrderedDict
+
+try:  # Python 3
+    import http.client as httpclient
+    from urllib.parse import quote as url_quote, urlencode
+except ImportError:  # Python 2
+    import httplib as httpclient
+    from urllib import quote as url_quote, urlencode
 
 
 # ===========================================================================
@@ -1884,6 +1893,200 @@ def not_implemented(program, command, roadmap=""):
         message += " (see docs/ROADMAP.md: %s)" % roadmap
     sys.stderr.write(message + "\n")
     return EXIT_NOT_IMPLEMENTED
+
+
+# ===========================================================================
+# Part 8: container engine client. Go: podman's libpod REST API (the server
+#         side is pkg/api, the client side is what `podman --remote` does).
+#         HTTP over a unix socket, for example the socket a qbox box forwards.
+# ===========================================================================
+
+class EngineError(RuntimeError):
+    """An API error. status is the HTTP status (0 if the socket was unreachable)."""
+
+    def __init__(self, status, message):
+        RuntimeError.__init__(self, message)
+        self.status = status
+        self.message = message
+
+
+class UnixHTTPConnection(httpclient.HTTPConnection):
+    """HTTP connection over a unix domain socket (Go: the default http client with a unix dialer)."""
+
+    def __init__(self, socket_path, timeout=60):
+        httpclient.HTTPConnection.__init__(self, "localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.socket_path)
+        self.sock = sock
+
+
+def socket_path_of(endpoint):
+    """Go: the unix:// form of a podman endpoint, reduced to the socket path."""
+    if endpoint.startswith("unix://"):
+        return endpoint[len("unix://"):]
+    raise ValueError("only unix:// endpoints are supported here, got %s" % endpoint)
+
+
+def _error_message(data, status):
+    try:
+        obj = json.loads(data.decode("utf-8", "replace"))
+        if isinstance(obj, dict):
+            return str(obj.get("cause") or obj.get("message") or obj)
+    except ValueError:
+        pass
+    text = data.decode("utf-8", "replace").strip()
+    return text or "HTTP %d" % status
+
+
+class EngineClient(object):
+    """Libpod REST client. Paths are unversioned; the server accepts them."""
+
+    def __init__(self, socket_path, timeout=60):
+        self.socket_path = socket_path
+        self.timeout = timeout
+
+    def request(self, method, path, query=None, body=None):
+        """Returns (status, body bytes). Socket errors become EngineError with status 0."""
+        if query:
+            pairs = []
+            for key, value in sorted(query.items()):
+                if value is None:
+                    continue
+                if isinstance(value, bool):
+                    value = "true" if value else "false"
+                pairs.append((key, value))
+            if pairs:
+                path = path + "?" + urlencode(pairs)
+        conn = UnixHTTPConnection(self.socket_path, self.timeout)
+        headers = {}
+        if body is not None:
+            body = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            return response.status, response.read()
+        except (socket.error, OSError, httpclient.HTTPException) as exc:
+            raise EngineError(0, "cannot reach %s: %s" % (self.socket_path, exc))
+        finally:
+            conn.close()
+
+    def call(self, method, path, query=None, expect=(200,), body=None):
+        status, data = self.request(method, path, query, body)
+        if status not in expect:
+            raise EngineError(status, _error_message(data, status))
+        return status, data
+
+    def get_json(self, path, query=None):
+        _, data = self.call("GET", path, query)
+        return json.loads(data.decode("utf-8", "replace")) if data else None
+
+    def ping(self):
+        status, _ = self.request("GET", "/_ping")
+        return status == 200
+
+    def version(self):
+        return self.get_json("/libpod/version")
+
+    def list_containers(self, all_containers=False):
+        return self.get_json("/libpod/containers/json", {"all": all_containers}) or []
+
+    def list_images(self):
+        return self.get_json("/libpod/images/json") or []
+
+    def inspect_container(self, name):
+        return self.get_json("/libpod/containers/%s/json" % url_quote(name, safe=""))
+
+    def inspect_image(self, name):
+        return self.get_json("/libpod/images/%s/json" % url_quote(name, safe=""))
+
+    def image_exists(self, name):
+        status, _ = self.request("GET", "/libpod/images/%s/exists" % url_quote(name, safe=""))
+        return status in (200, 204)
+
+    def pull(self, reference, quiet=True):
+        _, data = self.call("POST", "/libpod/images/pull", {"reference": reference, "quiet": quiet})
+        return json.loads(data.decode("utf-8", "replace")) if data else {}
+
+    def container_action(self, name, action, query=None):
+        """start, stop, restart (stop and restart take timeout in the query)."""
+        self.call("POST", "/libpod/containers/%s/%s" % (url_quote(name, safe=""), action),
+                  query, expect=(200, 204, 304))
+
+    def remove_container(self, name, force=False):
+        self.call("DELETE", "/libpod/containers/%s" % url_quote(name, safe=""),
+                  {"force": force}, expect=(200, 204))
+
+    def remove_image(self, name, force=False):
+        self.call("DELETE", "/libpod/images/%s" % url_quote(name, safe=""),
+                  {"force": force}, expect=(200,))
+
+    def create_container(self, spec):
+        """Go: POST /libpod/containers/create with a SpecGenerator. Returns the new id."""
+        _, data = self.call("POST", "/libpod/containers/create", None,
+                            expect=(200, 201), body=spec)
+        return json.loads(data.decode("utf-8", "replace"))["Id"]
+
+    def wait_container(self, name, condition="stopped"):
+        """Blocks until the condition holds; returns the exit code."""
+        _, data = self.call("POST", "/libpod/containers/%s/wait" % url_quote(name, safe=""),
+                            {"condition": condition}, expect=(200,))
+        return int(json.loads(data.decode("utf-8", "replace")))
+
+    def container_logs(self, name):
+        _, data = self.call("GET", "/libpod/containers/%s/logs" % url_quote(name, safe=""),
+                            {"stdout": True, "stderr": True})
+        return data
+
+
+def demux_frames(data):
+    """Log frames of a container without a tty: an 8-byte header (stream, 0, 0, 0, size as
+    big-endian uint32), then the payload. Returns a list of (stream, bytes), stream 1 stdout, 2 stderr."""
+    buf = bytearray(data)
+    frames = []
+    i = 0
+    while i + 8 <= len(buf):
+        size = (buf[i + 4] << 24) | (buf[i + 5] << 16) | (buf[i + 6] << 8) | buf[i + 7]
+        frames.append((buf[i], bytes(buf[i + 8:i + 8 + size])))
+        i += 8 + size
+    return frames
+
+
+def format_table(headers, rows):
+    """Plain columns, separated by two spaces, like podman's default output."""
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
+    for row in rows:
+        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    return "\n".join(lines) + "\n"
+
+
+_TEMPLATE_FIELD = re.compile(r"\{\{\s*\.([A-Za-z0-9_.]+)\s*\}\}")
+
+
+def format_template(template, obj):
+    """The part of Go templates that --format uses here: {{.Field}}, {{.A.B}}, \\t and \\n.
+
+    A missing field prints "<no value>", as Go does.
+    """
+    def field(match):
+        value = obj
+        for part in match.group(1).split("."):
+            if not isinstance(value, dict) or part not in value:
+                return "<no value>"
+            value = value[part]
+        if value is None:
+            return "<no value>"
+        return str(value)
+    text = _TEMPLATE_FIELD.sub(field, template)
+    return text.replace("\\t", "\t").replace("\\n", "\n")
 
 
 # ===========================================================================

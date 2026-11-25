@@ -40,6 +40,7 @@ Not yet ported:
 | `buildah.py`                   | Command line: `buildah` (version; image build is out of scope) |
 | `podman_machine_os.py`         | Command line: `podman-machine-os` (version; the rest not implemented) |
 | `test_cli.py`                  | Tests of the command line programs |
+| `test_engine.py`               | Tests of the remote commands against a fake libpod service on a unix socket |
 | `test_podmanlib.py`            | Unit tests |
 | `.github/workflows/ci.yml`     | CI: lint, unit tests on several Python versions, a Python 2.7 run, and the cross-checks |
 | `docs/ROADMAP.md`              | What is left to run containers, in order |
@@ -80,6 +81,25 @@ python3 buildah.py build .           # out of scope, exit status 3
 ```
 
 Exit status: 0 ok, 1 operation failed, 2 usage error, 3 not implemented.
+
+## Remote engine (podman --remote)
+
+`podman.py` talks to a podman service over a unix socket, the way `podman --remote` does. That is how it
+works with a qbox box: the box forwards its podman API as a socket, and the host client uses it.
+
+```bash
+export CONTAINER_HOST=unix:///path/to/podman.sock     # or: -c NAME (a system connection), --url URL
+python3 podman.py ps -a
+python3 podman.py images --format '{{.Repository}}:{{.Tag}}'
+python3 podman.py pull alpine:3.20
+python3 podman.py run --rm -e A=1 -p 8080:80 -v /data:/srv:ro docker.io/library/alpine uname -m
+python3 podman.py logs NAME
+python3 podman.py system connection add --default qbox-inkb unix:///path/to/sock
+```
+
+`run` creates the container, starts it, waits for it to exit, prints its output and removes it with `--rm`.
+Interactive runs (`-i`, `-t`) and attaching to a running container are not supported yet; use `-d` for
+services. The API is the one of the podman service in the box, so the container itself runs there.
 
 ## Usage
 
