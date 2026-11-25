@@ -98,6 +98,11 @@ python3 podman.py system connection add --default qbox-inkb unix:///path/to/sock
 ```
 
 `run` creates the container, starts it, waits for it to exit, prints its output and removes it with `--rm`.
+
+Tested live against podman 4.9.3 in a qbox aarch64 box, through the box's forwarded socket and
+`qbox connect` / `qbox podman`: version, ps, images, pull, image exists, run (with -d, -e, -p, -v, -w,
+--rm and exit codes), logs, inspect, stop, rm, and the error paths. Podman 4.9 needs the API version in
+the path (`/v4.9.0/libpod/...`); the client reads it from `/version`.
 Interactive runs (`-i`, `-t`) and attaching to a running container are not supported yet; use `-d` for
 services. The API is the one of the podman service in the box, so the container itself runs there.
 
