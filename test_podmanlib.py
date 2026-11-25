@@ -266,5 +266,78 @@ class MachineConnectionsTest(unittest.TestCase):
             os.environ.update(saved)
 
 
+class ManifestPortTest(unittest.TestCase):
+    OCI_MANIFEST = b'{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json"}}'
+    S2 = b'{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}'
+
+    def test_guess_mime_type(self):
+        self.assertEqual(pl.GuessMIMEType(self.S2), pl.DOCKER_V2_SCHEMA2_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(self.OCI_MANIFEST), pl.OCI1_MANIFEST_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":1}'), pl.DOCKER_V2_SCHEMA1_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":1,"signatures":[{}]}'),
+                         pl.DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[]}'),
+                         pl.OCI1_MANIFEST_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[{}]}'),
+                         pl.OCI1_INDEX_MEDIA_TYPE)
+
+    def test_guess_mime_type_refuses_wrong_types_like_go(self):
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":"2"}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2.0}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{"mediaType":5}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"config":"x"}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[{"digest":[1]}]}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[{"data":"!!"}]}'), "")
+        self.assertEqual(pl.GuessMIMEType(b'[]'), "")
+        self.assertEqual(pl.GuessMIMEType(b'{'), "")
+
+    def test_go_byte_slices_accept_numbers_and_base64(self):
+        # Go decodes []byte from base64 or from an array of bytes; [] is valid.
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[{"data":[]}]}'),
+                         pl.OCI1_INDEX_MEDIA_TYPE)
+        self.assertEqual(pl.GuessMIMEType(b'{"schemaVersion":2,"manifests":[{"data":[256]}]}'), "")
+
+    def test_normalized_mime_type(self):
+        self.assertEqual(pl.NormalizedMIMEType("application/json"),
+                         pl.DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE)
+        self.assertEqual(pl.NormalizedMIMEType("text/plain"), pl.DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE)
+        self.assertEqual(pl.NormalizedMIMEType(pl.OCI1_INDEX_MEDIA_TYPE), pl.OCI1_INDEX_MEDIA_TYPE)
+
+    def test_digest_is_sha256_of_the_blob(self):
+        self.assertEqual(pl.Digest(b"abc"[0:0] + self.S2),
+                         "sha256:" + __import__("hashlib").sha256(self.S2).hexdigest())
+        self.assertTrue(pl.MatchesDigest(self.S2, pl.Digest(self.S2)))
+
+    def test_wanted_platforms_for_arm_variants(self):
+        got = [(p["architecture"], p["variant"]) for p in
+               pl.WantedPlatforms({"ArchitectureChoice": "arm", "OSChoice": "linux",
+                                   "VariantChoice": "v7"})]
+        self.assertEqual(got, [("arm", "v7"), ("arm", "v6"), ("arm", "v5"), ("arm", "")])
+        got = [p["variant"] for p in pl.WantedPlatforms({"ArchitectureChoice": "arm64"})]
+        self.assertEqual(got, ["", "v8"])  # Go: "" first, then the compatible variants
+
+    def test_index_prefers_the_platform_then_gzip(self):
+        manifests = [
+            {"digest": "sha256:amd", "platform": {"architecture": "amd64", "os": "linux", "variant": ""}},
+            {"digest": "sha256:arm8", "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}},
+            {"digest": "sha256:zstd", "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"},
+             "annotations": {"io.github.containers.compression.zstd": "true"}},
+        ]
+        ctx = {"ArchitectureChoice": "arm64", "OSChoice": "linux"}
+        # Go: without preferGzip the zstd instance wins a tie; with preferGzip the other one does.
+        self.assertEqual(pl.OCI1IndexChooseInstance(manifests, ctx), "sha256:zstd")
+        self.assertEqual(pl.OCI1IndexChooseInstance(manifests, ctx, pl.OPTIONAL_BOOL_TRUE), "sha256:arm8")
+        only_zstd = [manifests[2]]
+        self.assertEqual(pl.OCI1IndexChooseInstance(only_zstd, ctx), "sha256:zstd")
+
+    def test_missing_platform_is_a_go_error_message(self):
+        with self.assertRaises(pl.ManifestError) as cm:
+            pl.Schema2ListChooseInstance(
+                [{"digest": "sha256:x", "platform": {"architecture": "amd64", "os": "linux"}}],
+                {"ArchitectureChoice": "s390x", "OSChoice": "linux"})
+        self.assertEqual(str(cm.exception), 'no image found in manifest list for architecture '
+                         '"s390x", variant "", OS "linux"')
+
+
 if __name__ == "__main__":
     unittest.main()

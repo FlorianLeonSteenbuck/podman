@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (pyflakes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install pyflakes
+      - run: python -m pyflakes *.py
+
+  unit:
+    name: unit tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: unit tests
+        run: python test_podmanlib.py
+      - name: image reference CLI
+        run: python image_reference.py alpine:3.20 Ubuntu
+      - name: machine connections CLI on a temporary file
+        run: |
+          export PODMAN_CONNECTIONS_CONF="$RUNNER_TEMP/podman-connections.json"
+          PODMAN_DEFAULT=1 python machine_connections.py add-pair podman-machine-default 501 62022 core /k
+          PODMAN_ROOTFUL=1 python machine_connections.py add-pair work 1000 2222 core /k
+          python machine_connections.py list
+          PODMAN_MACHINES="work=1" python machine_connections.py remove work
+          python machine_connections.py list
+
+  python27:
+    name: unit tests (python 2.7, informational)
+    runs-on: ubuntu-24.04
+    container: python:2.7
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m py_compile podmanlib.py machine_connections.py test_podmanlib.py
+      - run: python test_podmanlib.py
+
+  crosscheck:
+    name: cross-check against the Go originals
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: fetch the upstream reference sources (shallow, read only)
+        run: |
+          git clone --depth 1 https://github.com/podman-container-tools/container-libs.git "$RUNNER_TEMP/container-libs"
+          git clone --depth 1 https://github.com/podman-container-tools/podman.git "$RUNNER_TEMP/podman"
+      - name: semver port
+        env:
+          PODMAN_GO_REFERENCE: ${{ runner.temp }}/container-libs
+        run: python check_semver_port.py
+      - name: image reference port
+        env:
+          PODMAN_GO_REFERENCE: ${{ runner.temp }}/container-libs
+        run: python check_reference_port.py 5000
+      - name: image manifest port
+        env:
+          PODMAN_GO_REFERENCE: ${{ runner.temp }}/container-libs
+        run: python check_manifest_port.py 5000
+      - name: machine connections port
+        env:
+          PODMAN_GO_PODMAN: ${{ runner.temp }}/podman
+        run: python check_machine_connections.py 50

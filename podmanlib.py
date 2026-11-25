@@ -10,6 +10,8 @@ Ported so far
   Part 2  go.mod reader                 own code, Go syntax subset
   Part 3  github.com/opencontainers/go-digest v1.0.0 (validation parts)
   Part 4  container-libs image/docker/reference     (image name parsing)
+  Part 6  image manifests: media types, digest, the platform of this machine,
+          choosing an image from an OCI index or a Docker manifest list
   Part 5  machine connections: pkg/machine/connection and common/pkg/config
           connections.go (ssh:// connections of a VM, podman-connections.json)
 
@@ -27,14 +29,19 @@ Design patterns used
 
 from __future__ import absolute_import, division, print_function
 
+import base64
 import errno
 import fcntl
 import functools
+import hashlib
 import io
 import json
+import numbers
 import os
+import platform as hostplatform
 import re
 import subprocess
+import sys
 import tempfile
 from collections import OrderedDict
 
@@ -1407,6 +1414,414 @@ def EditConnectionConfig(callback, path=None):
             fcntl.lockf(lock_fh.fileno(), fcntl.LOCK_UN)
     finally:
         lock_fh.close()
+
+
+# ===========================================================================
+# Part 6: image manifests. Go: container-libs image/internal/manifest
+#         (manifest.go, oci_index.go, docker_schema2_list.go) and
+#         image/internal/pkg/platform (platform_matcher.go).
+#         Media types, digests, the platform of this machine, and choosing the
+#         image from an OCI index or a Docker manifest list.
+# ===========================================================================
+
+DOCKER_V2_SCHEMA1_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v1+json"
+DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v1+prettyjws"
+DOCKER_V2_SCHEMA2_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+DOCKER_V2_SCHEMA2_CONFIG_MEDIA_TYPE = "application/vnd.docker.container.image.v1+json"
+DOCKER_V2_LIST_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.list.v2+json"
+OCI1_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI1_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI1_CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json"
+OCI1_INSTANCE_ANNOTATION_COMPRESSION_ZSTD = "io.github.containers.compression.zstd"
+
+# Go: types.OptionalBool (iota order)
+OPTIONAL_BOOL_UNDEFINED = 0
+OPTIONAL_BOOL_TRUE = 1
+OPTIONAL_BOOL_FALSE = 2
+
+MAX_INT64 = 2 ** 63 - 1       # Go: math.MaxInt on 64-bit platforms
+MIN_INT64 = -(2 ** 63)
+
+# Go: platform_matcher.go
+COMPATIBILITY = {"arm": ["v8", "v7", "v6", "v5"], "arm64": ["v8"]}
+GOARCH_BY_MACHINE = {
+    "x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
+    "armv7l": "arm", "armv6l": "arm", "i686": "386", "i386": "386",
+    "ppc64le": "ppc64le", "s390x": "s390x", "riscv64": "riscv64",
+}
+GOOS_BY_SYS_PLATFORM = {"linux": "linux", "darwin": "darwin", "win32": "windows",
+                        "freebsd": "freebsd"}
+
+_STRING_TYPES = (type(u""), type(""))  # text in Python 2 and 3
+
+
+class ManifestError(ValueError):
+    """Error of the manifest code. str() is the Go message."""
+
+
+class _JSONTypeError(ValueError):
+    """A JSON value that Go's json.Unmarshal would refuse for the Go type."""
+
+
+# --- JSON, the way Go decodes it into typed structs --------------------------
+
+
+def _reject_constant(name):
+    raise ValueError("invalid JSON constant " + name)
+
+
+def _go_decode(blob):
+    """Decode with the standard parser. NaN and Infinity are refused, as in Go."""
+    text = blob.decode("utf-8", "replace") if isinstance(blob, bytes) else blob
+    return json.loads(text, parse_constant=_reject_constant)
+
+
+def _is_int64(value):
+    return (isinstance(value, numbers.Integral) and not isinstance(value, bool)
+            and MIN_INT64 <= value <= MAX_INT64)
+
+
+def _is_base64(value):
+    try:
+        base64.b64decode(value, validate=True)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _is_go_bytes(value):
+    """Go: []byte from JSON. A base64 string, or an array of numbers from 0 to 255."""
+    if isinstance(value, _STRING_TYPES):
+        return _is_base64(value)
+    if isinstance(value, list):
+        return all(isinstance(x, numbers.Integral) and not isinstance(x, bool)
+                   and 0 <= x <= 255 for x in value)
+    return False
+
+
+def _string_field(obj, key):
+    """A string field of a decoded object. null means "" (Go leaves the zero value)."""
+    value = obj.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, _STRING_TYPES):
+        raise _JSONTypeError(key)
+    return value
+
+
+PLATFORM_SPEC = (("architecture", "str"), ("os", "str"), ("os.version", "str"),
+                 ("os.features", "strlist"), ("variant", "str"))
+DESCRIPTOR_SPEC = (("mediaType", "str"), ("digest", "str"), ("size", "int64"),
+                   ("urls", "strlist"), ("annotations", "strmap"), ("data", "b64"),
+                   ("platform", "platform"), ("artifactType", "str"))
+
+
+def _typed_object(value, spec):
+    """Check the fields of a JSON object against the Go field kinds in spec.
+
+    null is accepted everywhere, as Go does. Unknown keys are ignored.
+    """
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise _JSONTypeError("object expected")
+    for key, kind in spec:
+        field = value.get(key)
+        if field is None:
+            continue
+        if kind == "platform":
+            _typed_object(field, PLATFORM_SPEC)
+        elif kind == "str" and not isinstance(field, _STRING_TYPES):
+            raise _JSONTypeError(key)
+        elif kind == "int64" and not _is_int64(field):
+            raise _JSONTypeError(key)
+        elif kind == "strlist":
+            if not isinstance(field, list):
+                raise _JSONTypeError(key)
+            if not all(x is None or isinstance(x, _STRING_TYPES) for x in field):
+                raise _JSONTypeError(key)
+        elif kind == "strmap":
+            if not isinstance(field, dict):
+                raise _JSONTypeError(key)
+            if not all(x is None or isinstance(x, _STRING_TYPES) for x in field.values()):
+                raise _JSONTypeError(key)
+        elif kind == "b64" and not _is_go_bytes(field):
+            raise _JSONTypeError(key)
+
+
+def _descriptor_list(value):
+    """Go: []imgspecv1.Descriptor. Returns the list; raises if a field has the wrong type."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise _JSONTypeError("array expected")
+    for item in value:
+        _typed_object(item, DESCRIPTOR_SPEC)
+    return value
+
+
+# --- Media types -------------------------------------------------------------
+
+
+def NormalizedMIMEType(value):
+    """Go: NormalizedMIMEType. Unknown values are treated as schema 1 signed."""
+    if value == "application/json":
+        return DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE
+    if value in (DOCKER_V2_SCHEMA1_MEDIA_TYPE, DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE,
+                 OCI1_MANIFEST_MEDIA_TYPE, OCI1_INDEX_MEDIA_TYPE,
+                 DOCKER_V2_SCHEMA2_MEDIA_TYPE, DOCKER_V2_LIST_MEDIA_TYPE):
+        return value
+    return DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE
+
+
+def _guess_schema2(meta):
+    """Go: the schemaVersion 2 branch of GuessMIMEType."""
+    config = meta.get("config")
+    if config is None:
+        config_media = ""
+    elif isinstance(config, dict):
+        config_media = _string_field(config, "mediaType")
+    else:
+        raise _JSONTypeError("config")
+    if config_media == OCI1_CONFIG_MEDIA_TYPE:
+        return OCI1_MANIFEST_MEDIA_TYPE
+    if config_media == DOCKER_V2_SCHEMA2_CONFIG_MEDIA_TYPE:
+        return DOCKER_V2_SCHEMA2_MEDIA_TYPE
+    if len(_descriptor_list(meta.get("manifests"))) != 0:
+        if config_media == "":
+            return OCI1_INDEX_MEDIA_TYPE
+        return config_media
+    return OCI1_MANIFEST_MEDIA_TYPE
+
+
+def GuessMIMEType(manifest):
+    """Go: GuessMIMEType. Returns "" where Go's json.Unmarshal would fail.
+
+    Not ported: the schema 1 check on the signature block beyond "signatures != nil".
+    """
+    try:
+        meta = _go_decode(manifest)
+        if meta is None:
+            meta = {}
+        if not isinstance(meta, dict):
+            return ""
+        media_type = _string_field(meta, "mediaType")
+        schema_version = meta.get("schemaVersion")
+        if schema_version is None:
+            schema_version = 0
+        elif not _is_int64(schema_version):
+            return ""
+        if media_type in (DOCKER_V2_SCHEMA2_MEDIA_TYPE, DOCKER_V2_LIST_MEDIA_TYPE,
+                          OCI1_MANIFEST_MEDIA_TYPE, OCI1_INDEX_MEDIA_TYPE):
+            return media_type
+        if schema_version == 1:
+            if meta.get("signatures") is not None:
+                return DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE
+            return DOCKER_V2_SCHEMA1_MEDIA_TYPE
+        if schema_version == 2:
+            return _guess_schema2(meta)
+    except ValueError:
+        return ""
+    return ""
+
+
+def Digest(manifest_blob):
+    """Go: Digest (canonical sha256 of the blob). Schema 1 signed blobs are not ported."""
+    if GuessMIMEType(manifest_blob) == DOCKER_V2_SCHEMA1_SIGNED_MEDIA_TYPE:
+        raise NotImplementedError("schema 1 signed manifests are not ported")
+    data = manifest_blob if isinstance(manifest_blob, bytes) else manifest_blob.encode("utf-8")
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def MatchesDigest(manifest_blob, expected_digest):
+    return Digest(manifest_blob) == expected_digest
+
+
+# --- The platform of this machine (platform_matcher.go) ----------------------
+
+
+def getCPUInfo(pattern):
+    """Go: getCPUInfo. Reads /proc/cpuinfo and returns the value of the first match."""
+    try:
+        with io.open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.rstrip("\r\n").split(":")
+                if len(parts) > 1 and parts[0].strip().lower() == pattern.lower():
+                    return parts[1].strip()
+    except (IOError, OSError) as exc:
+        raise ManifestError(str(exc))
+    raise ManifestError("getCPUInfo for pattern: %s not found" % pattern)
+
+
+def getCPUVariantFromArch(arch):
+    if arch == "arm64":
+        return "v8"
+    if arch == "arm":
+        return "v7"
+    return ""
+
+
+def getCPUVariantLinuxArm():
+    try:
+        variant = getCPUInfo("Cpu architecture")
+    except ManifestError:
+        return ""
+    low = variant.lower()
+    if low in ("8", "aarch64"):
+        return "v8"
+    if low in ("7m", "?(12)", "?(13)", "?(14)", "?(15)", "?(16)", "?(17)"):
+        return "v7"
+    if low == "7":
+        try:
+            model = getCPUInfo("model name")
+        except ManifestError:
+            return ""
+        if model.lower().startswith("armv6-compatible"):
+            return "v6"
+        return "v7"
+    if low in ("6", "6tej"):
+        return "v6"
+    if low in ("5", "5t", "5te", "5tej"):
+        return "v5"
+    if low in ("4", "4t"):
+        return "v4"
+    if low == "3":
+        return "v3"
+    return ""
+
+
+def getCPUVariant(goos, goarch):
+    if goos != "linux":
+        return getCPUVariantFromArch(goarch)
+    if goarch in ("arm", "arm64"):
+        return getCPUVariantLinuxArm()
+    return ""
+
+
+def host_goarch():
+    machine = hostplatform.machine()
+    return GOARCH_BY_MACHINE.get(machine, machine)
+
+
+def host_goos():
+    return GOOS_BY_SYS_PLATFORM.get(sys.platform, sys.platform)
+
+
+def WantedPlatforms(ctx=None):
+    """Go: platform.WantedPlatforms. ctx is a dict with the Go field names, or None.
+
+    Without ArchitectureChoice the host architecture and variant are used.
+    Returns a list of dicts with the keys os, architecture and variant.
+    """
+    ctx = ctx or {}
+    wanted_arch = host_goarch()
+    wanted_variant = ""
+    if ctx.get("ArchitectureChoice"):
+        wanted_arch = ctx["ArchitectureChoice"]
+    else:
+        wanted_variant = getCPUVariant(host_goos(), host_goarch())
+    if ctx.get("VariantChoice"):
+        wanted_variant = ctx["VariantChoice"]
+    wanted_os = host_goos()
+    if ctx.get("OSChoice"):
+        wanted_os = ctx["OSChoice"]
+
+    variants = []
+    if wanted_variant != "":
+        order = COMPATIBILITY.get(wanted_arch)
+        if order is not None and wanted_variant in order:
+            variants = order[order.index(wanted_variant):]
+        if not variants:
+            variants = [wanted_variant]
+        variants.append("")
+    else:
+        variants.append("")
+        if wanted_arch in COMPATIBILITY:
+            variants.extend(COMPATIBILITY[wanted_arch])
+    return [{"os": wanted_os, "architecture": wanted_arch, "variant": v} for v in variants]
+
+
+def _platform_key(p):
+    """The three fields that decide a match (Go compares Architecture, OS and Variant)."""
+    p = p or {}
+    return {"os": p.get("os") or "", "architecture": p.get("architecture") or "",
+            "variant": p.get("variant") or ""}
+
+
+def MatchesPlatform(image, wanted):
+    return _platform_key(image) == _platform_key(wanted)
+
+
+# --- Choosing the image for this machine -------------------------------------
+
+
+def instanceIsZstd(descriptor):
+    annotations = descriptor.get("annotations") or {}
+    return annotations.get(OCI1_INSTANCE_ANNOTATION_COMPRESSION_ZSTD) == "true"
+
+
+MAX_INT = MAX_INT64
+
+
+def _candidate_is_preferred_over(ic, other, prefer_gzip):
+    """Go: instanceCandidate.isPreferredOver."""
+    if ic["platform_index"] != other["platform_index"]:
+        return ic["platform_index"] < other["platform_index"]
+    if ic["is_zstd"] != other["is_zstd"]:
+        if prefer_gzip != OPTIONAL_BOOL_TRUE:
+            return ic["is_zstd"]
+        return not ic["is_zstd"]
+    if ic["manifest_position"] != other["manifest_position"]:
+        return ic["manifest_position"] < other["manifest_position"]
+    raise RuntimeError("internal error: invalid comparison between two candidates")
+
+
+def OCI1IndexChooseInstance(manifests, ctx=None, prefer_gzip=OPTIONAL_BOOL_FALSE):
+    """Go: (*OCI1IndexPublic).ChooseInstance and chooseInstance.
+
+    manifests is a list of dicts with the keys digest, platform (or None) and
+    annotations. Returns the digest of the best image for the wanted platforms.
+    """
+    wanted = WantedPlatforms(ctx)
+    best = None
+    for position, d in enumerate(manifests):
+        candidate = {"platform_index": MAX_INT, "manifest_position": position,
+                     "is_zstd": instanceIsZstd(d), "digest": d.get("digest") or ""}
+        platform_dict = d.get("platform")
+        if platform_dict is not None:
+            index = -1
+            for i, w in enumerate(wanted):
+                if MatchesPlatform(platform_dict, w):
+                    index = i
+                    break
+            if index == -1:
+                continue
+            candidate["platform_index"] = index
+        if best is None or _candidate_is_preferred_over(candidate, best, prefer_gzip):
+            best = candidate
+    if best is not None:
+        return best["digest"]
+    first = wanted[0]
+    raise ManifestError('no image found in image index for architecture "%s", '
+                        'variant "%s", OS "%s"'
+                        % (first["architecture"], first["variant"], first["os"]))
+
+
+def Schema2ListChooseInstance(manifests, ctx=None):
+    """Go: (*Schema2ListPublic).ChooseInstance.
+
+    manifests is a list of dicts with the keys digest and platform (a dict
+    with architecture, os, variant; None counts as an empty platform).
+    """
+    wanted = WantedPlatforms(ctx)
+    for w in wanted:
+        for d in manifests:
+            if MatchesPlatform(d.get("platform") or {}, w):
+                return d.get("digest") or ""
+    first = wanted[0]
+    raise ManifestError('no image found in manifest list for architecture "%s", '
+                        'variant "%s", OS "%s"'
+                        % (first["architecture"], first["variant"], first["os"]))
 
 
 # ===========================================================================

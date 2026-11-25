@@ -24,7 +24,7 @@ Nothing here builds or serves images.
 
 | #    | Piece (Go package)                          | Go lines | Notes |
 |------|---------------------------------------------|----------|-------|
-| 1.1  | `image/manifest`                            | 1362     | OCI and Docker manifests, indexes, platform choice. Pure logic, good first step. |
+| 1.1  | `image/manifest`                            | 1362     | **Partly done:** media types, digest, the platform of this machine, choosing the image from an index or a manifest list (cross-checked). Still open: parsing of schema2 and OCI manifests and configs. |
 | 1.2  | `image/types`, `image/transports`           | 870      | Interfaces and transport names (`docker://`, `containers-storage:`, `oci:`, `dir:`). |
 | 1.3  | `image/docker`                              | 4835     | Registry client: token auth, manifest and blob download. Testable against a local fake registry. |
 | 1.4  | `storage` (top level)                       | 11378    | Layer, image and container stores (JSON metadata, lock files). Start with the parts pulls need. |

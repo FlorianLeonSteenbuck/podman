@@ -16,25 +16,30 @@ lists the pieces needed to run containers, with line counts and the order.
 | go-digest validation                                        | ported, cross-checked |
 | go.mod reader                                               | own code |
 | Machine connections: `pkg/machine/connection`, `common/pkg/config/connections.go` (podman) | ported, cross-checked; file format and lock as Go |
+| Image manifests: `image/internal/manifest`, `image/internal/pkg/platform` (container-libs) | partly: media types, digest, platform choice, index and list choice; cross-checked |
 
-Not yet ported inside the parts above: `FamiliarMatch` (needs Go's `path.Match`)
-and the `Field` encoding helper of `image/docker/reference`. Opening the ssh
-connection itself (`common/pkg/ssh`) is not ported.
+Not yet ported:
+
+- In the reference package: `FamiliarMatch` (needs Go's `path.Match`) and the `Field` encoding helper.
+- In the manifest code: parsing of schema2 and OCI manifests and configs, and digests of schema 1 signed manifests.
+- Opening the ssh connection itself (`common/pkg/ssh`), the machine daemon, and everything that starts a VM.
 
 ## Files
 
-| File                          | What it is |
-|-------------------------------|------------|
-| `podmanlib.py`                | The library: all ported code, in five parts |
-| `machine_connections.py`      | Main-based CLI: list, add and remove the machine connections in the same file podman uses |
-| `image_reference.py`          | Main-based CLI: parses image references and prints the parts |
-| `check_semver_port.py`        | Checks the semver port against the Go original |
-| `check_reference_port.py`     | Checks the reference and digest ports against the Go original |
-| `check_machine_connections.py`| Checks the machine connection code against the Go original |
-| `test_podmanlib.py`           | Unit tests |
-| `docs/ROADMAP.md`            | What is left to run containers, in order |
+| File                           | What it is |
+|--------------------------------|------------|
+| `podmanlib.py`                 | The library: all ported code, in six parts |
+| `machine_connections.py`       | Main-based CLI: list, add and remove the machine connections in the same file podman uses |
+| `image_reference.py`           | Main-based CLI: parses image references and prints the parts |
+| `check_semver_port.py`         | Checks the semver port against the Go original |
+| `check_reference_port.py`      | Checks the reference and digest ports against the Go original |
+| `check_manifest_port.py`       | Checks the manifest port against the Go original |
+| `check_machine_connections.py` | Checks the machine connection code against the Go original |
+| `test_podmanlib.py`            | Unit tests |
+| `.github/workflows/ci.yml`     | CI: lint, unit tests on several Python versions, a Python 2.7 run, and the cross-checks |
+| `docs/ROADMAP.md`              | What is left to run containers, in order |
 
-`podmanlib.py` has five parts:
+`podmanlib.py` has six parts:
 
 1. **semver**: a line-by-line port of `golang.org/x/mod/semver/semver.go`.
 2. **go.mod reader**: `module`, `go`, `require` and `replace`, single-line and block form.
@@ -44,6 +49,10 @@ connection itself (`common/pkg/ssh`) is not ported.
 5. **machine connections**: the ssh connections of a machine (`name` and `name-root`), the
    default connection, the `ssh://` URL (Go's `url.URL.String()` escaping), and the
    `podman-connections.json` file with its lock.
+6. **image manifests**: `GuessMIMEType`, `NormalizedMIMEType`, `Digest`, the platform of this
+   machine (`WantedPlatforms`, including the `/proc/cpuinfo` variant detection), and the
+   choice of an image from an OCI index (`chooseInstance`, with gzip and zstd preference) or a
+   Docker manifest list (`ChooseInstance`).
 
 Go identifiers are kept on purpose, so each function can be read next to the
 Go function it came from. Go's `$` is written as `\Z` in the patterns, because
@@ -71,32 +80,48 @@ checkout is only read. The Go code is built in a temporary directory.
 ```bash
 PODMAN_GO_REFERENCE=/path/to/container-libs python3 check_semver_port.py
 PODMAN_GO_REFERENCE=/path/to/container-libs python3 check_reference_port.py [count]
+PODMAN_GO_REFERENCE=/path/to/container-libs python3 check_manifest_port.py [count]
 PODMAN_GO_PODMAN=/path/to/podman python3 check_machine_connections.py [scenarios]
 ```
 
 Exit status of the checks: 0 when every line is equal, 1 on mismatches, 2 when
 the checkout or the `go` binary is missing.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **lint**: pyflakes on all Python files.
+- **unit**: the unit tests on Python 3.10, 3.12 and 3.13, plus smoke runs of the CLIs.
+- **python27**: the unit tests on Python 2.7. This job is informational (`continue-on-error`).
+- **crosscheck**: clones the upstream repositories shallowly, then runs the four checks
+  against the Go original.
+
 ## Verification
 
 Each check runs the Python port and the original Go code on the same inputs and
 compares every output line.
 
-| Check                        | Inputs                                                       | Result |
-|------------------------------|--------------------------------------------------------------|--------|
-| `check_semver_port.py`       | 20,841 version pairs, plus sorting of 6,695 strings          | 0 mismatches |
-| `check_reference_port.py`    | 20,410 inputs: string literals from the package tests plus mutations | 0 mismatches |
+| Check                          | Inputs                                                       | Result |
+|--------------------------------|--------------------------------------------------------------|--------|
+| `check_semver_port.py`         | 20,841 version pairs, plus sorting of 6,695 strings          | 0 mismatches |
+| `check_reference_port.py`      | 20,410 inputs: string literals from the package tests plus mutations | 0 mismatches |
+| `check_manifest_port.py`       | 20,000 operations: media type detection on generated JSON with wrong field types, normalization, platform lists, index and list choice | 0 mismatches |
 | `check_machine_connections.py` | 11,741 operations in random sequences (adds, pairs, defaults, removals, URL escaping), with the file compared after each step | 0 mismatches |
 
-For the machine connections the Go side is `connection.go` and `add.go` from
-podman, unchanged except for two import paths. The configuration types are stubs
-with the same JSON tags as container-libs.
+For the manifest code, the Go functions are copied verbatim out of the checkout
+(`GuessMIMEType`, `NormalizedMIMEType`, `chooseInstance`, `ChooseInstance`, the
+platform matcher file). Only the types they use are stubs. The machine connection
+check works the same way with `connection.go` and `add.go` from podman.
 
-One bug was found by the reference check. The Go separator `[-]*` can match an
-empty string. In Python's backtracking regex engine this made parsing exponential:
-a 14-character name took 25 seconds. The port uses `-+` instead. This is the same
-language, because two adjacent alphanumeric runs with an empty separator form one
-run. Go's RE2 engine is linear, so it never had the problem.
+Two bugs were found by these checks and fixed:
+
+- The reference check: Go's separator `[-]*` can match an empty string. In Python's
+  backtracking regex engine this made parsing exponential: a 14-character name took
+  25 seconds. The port uses `-+` instead. This is the same language, because two adjacent
+  alphanumeric runs with an empty separator form one run.
+- The manifest check: Go decodes a `[]byte` field from a base64 string or from an array
+  of numbers from 0 to 255. The port accepted only the string form.
 
 ## Deviations from Go
 
@@ -108,6 +133,7 @@ run. Go's RE2 engine is linear, so it never had the problem.
   nil. The port starts an empty map.
 - **Unknown keys.** Keys the port does not use are kept in the file, so a file
   written here loses nothing podman needs.
+- **Schema 1.** Digests of schema 1 signed manifests raise `NotImplementedError`.
 - **Not tested against real podman.** The file format matches Go's JSON tags, and
   the lock is the same kind. Reading a file written here with the real podman
   binary has not been run.
@@ -127,4 +153,5 @@ The plain name is taken by the semver function `Canonical`, which keeps its Go n
 ## Python versions
 
 The code is written for Python 2.7 and 3.x: `from __future__` imports, no
-f-strings, no type annotations, no `ctypes`. It was run and tested on Python 3.13 only.
+f-strings, no type annotations, no `ctypes`. Python 3.10 to 3.13 are tested in CI.
+Python 2.7 is run in CI as an informational job; it was not run locally.
