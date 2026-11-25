@@ -17,11 +17,14 @@ lists the pieces needed to run containers, with line counts and the order.
 | go.mod reader                                               | own code |
 | Machine connections: `pkg/machine/connection`, `common/pkg/config/connections.go` (podman) | ported, cross-checked; file format and lock as Go |
 | Image manifests: `image/internal/manifest`, `image/internal/pkg/platform` (container-libs) | partly: media types, digest, platform choice, index and list choice; cross-checked |
+| Registry pull: `image/docker` (token auth, manifests, blobs) and layer unpacking (`storage/pkg/archive`, whiteouts) | partly: Part 11; tested against a fake registry and against docker.io (alpine:3.20) |
 
 Not yet ported:
 
 - In the reference package: `FamiliarMatch` (needs Go's `path.Match`) and the `Field` encoding helper.
-- In the manifest code: parsing of schema2 and OCI manifests and configs, and digests of schema 1 signed manifests.
+- In the manifest code: digests of schema 1 signed manifests.
+- In the registry code: basic auth, mirrors, credentials, insecure registries, zstd layers, and streaming
+  of layers to disk (they are read into memory).
 - Opening the ssh connection itself (`common/pkg/ssh`), the machine daemon, and everything that starts a VM.
 
 ## Files
@@ -35,14 +38,15 @@ Not yet ported:
 | `check_reference_port.py`      | Checks the reference and digest ports against the Go original |
 | `check_manifest_port.py`       | Checks the manifest port against the Go original |
 | `check_machine_connections.py` | Checks the machine connection code against the Go original |
-| `podman.py`                    | Command line: `podman` with the commands that exist here (version, image parse, manifest guess, digest and choose, machine connection); the others exit with status 3 |
+| `podman.py`                    | Command line: `podman` with the commands that exist here (version, image parse, manifest guess, digest and choose, machine connection, remote run, ps, pull, pods, logs); the others exit with status 3 |
 | `skopeo.py`                    | Command line: `skopeo` (version; the rest not implemented) |
 | `buildah.py`                   | Command line: `buildah` (version; image build is out of scope) |
 | `podman_machine_os.py`         | Command line: `podman-machine-os` (version; the rest not implemented) |
 | `test_cli.py`                  | Tests of the command line programs |
 | `oci_run.py`                   | Runs one command in a rootfs with crun (or runc) through a minimal OCI bundle |
-| `pmpy_server.py`               | Engine server on a unix socket: containers and images, run through the OCI runtime |
+| `pmpy_server.py`               | Engine server on a unix socket: containers, pods, ports, pulls, run through the OCI runtime |
 | `test_server.py`               | Tests of the engine server with the real client and a fake runtime |
+| `test_registry.py`             | Tests of pulls: a fake registry with token auth, layers, whiteouts, digests, path rules |
 | `test_oci.py`                  | Tests of the runtime choice and the spec |
 | `test_engine.py`               | Tests of the remote commands against a fake libpod service on a unix socket |
 | `test_podmanlib.py`            | Unit tests |
@@ -79,7 +83,7 @@ python3 podman.py version
 python3 podman.py image parse alpine:3.20
 python3 podman.py manifest choose index.json --arch arm64 --os linux
 python3 podman.py machine connection list
-python3 podman.py pull alpine        # not implemented yet, exit status 3
+python3 podman.py pull alpine:3.20    # from docker.io, into the engine store (needs the server)
 python3 skopeo.py copy a b           # not implemented yet, exit status 3
 python3 buildah.py build .           # out of scope, exit status 3
 ```
@@ -107,8 +111,8 @@ Tested live against podman 4.9.3 in a qbox aarch64 box, through the box's forwar
 `qbox connect` / `qbox podman`: version, ps, images, pull, image exists, run (with -d, -e, -p, -v, -w,
 --rm and exit codes), logs, inspect, stop, rm, and the error paths. Podman 4.9 needs the API version in
 the path (`/v4.9.0/libpod/...`); the client reads it from `/version`.
-Interactive runs (`-i`, `-t`) and attaching to a running container are not supported yet; use `-d` for
-services. The API is the one of the podman service in the box, so the container itself runs there.
+Interactive runs (`-i`, `-t`) are not supported yet. `logs -f` and a run without `-d` show the output while
+the container runs. The API is the one of the podman service in the box, so the container itself runs there.
 
 ## OCI runtime (crun first, runc second)
 
@@ -123,26 +127,43 @@ Tested in a qbox box (Ubuntu 24.04, crun 1.14.1, cgroup v2): `uname -m` prints `
 exit status are passed through. The rootfs in the test came from an alpine export; pulling images
 is not ported yet.
 
-Limits: the spec has pid, ipc, uts and mount namespaces only, so the container shares the host's network;
-no cgroup limits, no volumes or ports, no detached containers yet.
+Limits: the spec has pid, ipc, uts and mount namespaces, plus a network namespace with `--network none`;
+no cgroup limits.
 
 ## Python engine server (replaces the Go server step by step)
 
 `pmpy_server.py` serves the part of the podman API that `podman.py` uses, on a unix socket. Containers run
-through the OCI runtime (crun, runc as fallback). Images come from a rootfs store filled with `image-import`.
+through the OCI runtime (crun, runc as fallback). Each container gets its own copy of the image's rootfs.
 
 ```bash
-python3 pmpy_server.py --home /var/lib/pmpy image-import alpine:3.20 /path/to/rootfs   # before serve
 python3 pmpy_server.py --home /var/lib/pmpy serve /run/pmpy.sock
+CONTAINER_HOST=unix:///run/pmpy.sock python3 podman.py pull alpine:3.20
 CONTAINER_HOST=unix:///run/pmpy.sock python3 podman.py run --rm alpine:3.20 uname -m
 ```
 
-Works: create, start, wait, stop (TERM, then KILL), logs, inspect, list, rm (with -f for running containers),
-images, exists, exit status and output. Verified in a qbox box with crun 1.14.1.
-Not yet: pull (answers 501 with a hint), ports (accepted, with a warning, not published), networking, pods,
-restart, attach, volumes beyond bind mounts. Container state is one JSON file; containers that were
-running when the server stopped are reported as exited. Run image-import while the server is stopped,
-because the server keeps its own copy of the state.
+A missing image is pulled by `run` first, as podman does by default. Images can also be taken from a local
+rootfs directory: `pmpy_server.py --home DIR image-import NAME ROOTFS` (run while the server is stopped).
+
+Works:
+
+- Containers: create, start, wait, stop (TERM, then KILL), logs, `logs -f`, attached run (output while it runs),
+  inspect, list, rm (with -f for running containers), images, exists, exit status and output.
+- Pull from a registry: docker.io and other v2 registries with bearer token auth; the manifest of this machine
+  is chosen from an index or list; blobs are checked against their digest; layers unpacked in order with
+  whiteouts. Tested against docker.io (alpine:3.20) and a fake registry.
+- Published ports: `-p HOST:CONTAINER`, tcp only. The server listens on the host port and copies each
+  connection to the container's port on loopback (the container shares the host network).
+- Networking: `--network host` (default) and `--network none` (own empty network namespace, no ports).
+- Pods: `pod create [--name N] [-p H:C]`, `pod ps`, `pod start`, `pod stop`, `pod rm [-f]`, `run --pod P`.
+  Pod members share the host network; the pod's ports are opened when the pod starts.
+- Restart policies: `--restart no|on-failure[:N]|always|unless-stopped`, with a delay that doubles up to
+  30 s. A stop during the delay is honoured. After a server restart, `resume()` starts the containers that
+  were running with `always` or `unless-stopped`.
+
+Not yet: bridge networking with its own IP address, udp ports, stdin (`-i`) and tty, exec, volumes beyond
+bind mounts, zstd layers, basic auth or credentials, and the overlay or other storage drivers. Layers are
+read into memory. Container state is one JSON file; containers that were running when the server stopped
+are reported as exited.
 
 ## Usage
 

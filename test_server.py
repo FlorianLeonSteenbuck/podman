@@ -200,12 +200,14 @@ class EngineServerTest(unittest.TestCase):
         self.assertEqual((code, out.strip()), (0, "exited 0"))
 
     def test_pull_and_unknown_image_are_clear_errors(self):
-        code, _, err = self.podman(["pull", "alpine:3.20"])
+        # nothing listens on port 9 here: the pull says so instead of hanging
+        code, _, err = self.podman(["pull", "127.0.0.1:9/library/alpine:3.20"])
         self.assertEqual(code, 1)
-        self.assertIn("no image pull yet", err)
-        code, _, err = self.podman(["run", "docker.io/library/nothere:1", "true"])
+        self.assertIn("cannot reach", err)
+        code, _, err = self.podman(["run", "--name", "nope", "127.0.0.1:9/library/alpine:3.20", "true"])
         self.assertEqual(code, 1)
-        self.assertIn("image not known", err)
+        self.assertIn("cannot reach", err)
+        self.assertEqual(self.engine.state["containers"], {})
 
     def test_images_listed_and_exists(self):
         code, out, _ = self.podman(["image", "exists", "alpine:3.20"])

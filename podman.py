@@ -543,6 +543,8 @@ def cmd_run(client, args):
             "work_dir": spec["workdir"], "pod": spec["pod"], "network": spec["network"],
             "restart_policy": spec["restart"]}
     body = dict((k, v) for k, v in body.items() if v is not None)
+    if not client.image_exists(spec["image"]):
+        client.pull(spec["image"])  # pull=missing: as podman does by default
     container = client.create_container(body)
     client.container_action(container, "start")
     if spec["detach"]:

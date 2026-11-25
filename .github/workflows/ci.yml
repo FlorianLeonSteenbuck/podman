@@ -46,6 +46,8 @@ jobs:
         run: python test_oci.py
       - name: engine server tests (fake runtime, real client)
         run: python test_server.py
+      - name: pull tests (fake registry, no network)
+        run: python test_registry.py
       - name: image reference CLI
         run: python image_reference.py alpine:3.20 Ubuntu
       - name: machine connections CLI on a temporary file
@@ -70,6 +72,7 @@ jobs:
       - run: python test_engine.py
       - run: python test_oci.py
       - run: python test_server.py
+      - run: python test_registry.py
 
   crosscheck:
     name: cross-check against the Go originals

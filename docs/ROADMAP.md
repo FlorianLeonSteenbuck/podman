@@ -24,11 +24,11 @@ Nothing here builds or serves images.
 
 | #    | Piece (Go package)                          | Go lines | Notes |
 |------|---------------------------------------------|----------|-------|
-| 1.1  | `image/manifest`                            | 1362     | **Partly done:** media types, digest, the platform of this machine, choosing the image from an index or a manifest list (cross-checked). Still open: parsing of schema2 and OCI manifests and configs. |
+| 1.1  | `image/manifest`                            | 1362     | **Partly done:** media types, digest, the platform of this machine, choosing the image from an index or a manifest list (cross-checked). Manifests and configs of schema 2 and OCI are read by the pull (part 11). |
 | 1.2  | `image/types`, `image/transports`           | 870      | Interfaces and transport names (`docker://`, `containers-storage:`, `oci:`, `dir:`). |
-| 1.3  | `image/docker`                              | 4835     | Registry client: token auth, manifest and blob download. Testable against a local fake registry. |
+| 1.3  | `image/docker`                              | 4835     | **Partly done (part 11):** registry v2 with bearer token auth, manifests, blobs with digest checks, pulls from docker.io and a fake registry. Open: basic auth, credentials, mirrors, insecure registries, streamed blobs. |
 | 1.4  | `storage` (top level)                       | 11378    | Layer, image and container stores (JSON metadata, lock files). Start with the parts pulls need. |
-| 1.5  | `storage/pkg/archive`, `idtools`            | 6400     | Tar layer unpacking with whiteouts, ID mapping. |
+| 1.5  | `storage/pkg/archive`, `idtools`            | 6400     | **Partly done (part 11):** tar layers with whiteouts and opaque directories, links kept inside the rootfs. Open: ID mapping, device nodes, zstd. |
 | 1.6  | `storage/drivers/vfs`                       | 477      | Simplest driver: every layer is a full copy. No mount privileges needed. |
 | 1.7  | `image/storage`                             | 3064     | The `containers-storage:` transport: writes pulled images into the store. |
 | 1.8  | `image/copy`                                | 3473     | Pull orchestration: choose layers, copy blobs, write the image. |
@@ -57,8 +57,10 @@ Nothing here builds or serves images.
 
 ## Tier 4: later
 
-Networking (`libpod/networking_*.go`, about 1000 lines), exec and attach,
-volumes, healthchecks, pods (`pod*.go`, about 1500), rootless user namespaces
+Bridge networking (`libpod/networking_*.go`, about 1000 lines; `host` and `none`
+are done, and ports are published by a Python forwarder), exec and attach (logs
+are streamed), volumes, healthchecks, pods beyond the basic set (`pod*.go`, about
+1500; create, start, stop, rm and ports are done), rootless user namespaces
 (`pkg/rootless`), cgroups v2 details, events, `kube` play, checkpoint and
 restore, `overlay` storage driver (`storage/drivers/overlay`, 3787 lines).
 

@@ -53,17 +53,22 @@ import tempfile
 import threading
 import time
 import shutil
+import gzip
+import tarfile
 from collections import OrderedDict
 
 try:  # Python 3
     import http.client as httpclient
     from http.server import BaseHTTPRequestHandler
     from urllib.parse import quote as url_quote, urlencode, unquote, parse_qs
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
 except ImportError:  # Python 2
     import httplib as httpclient
     from BaseHTTPServer import BaseHTTPRequestHandler
     from urllib import quote as url_quote, urlencode, unquote
     from urlparse import parse_qs
+    from urllib2 import HTTPError, Request, urlopen
 
 
 # ===========================================================================
@@ -2648,7 +2653,7 @@ class EngineServer(object):
     def image_import(self, name, rootfs):
         """Makes rootfs (a directory) an image under the normalized name. Returns that name."""
         try:
-            ref = ParseNormalizedNamed(name).String()
+            ref = image_key(name)
         except ValueError as exc:
             raise ServerError(400, str(exc))
         rootfs = os.path.abspath(rootfs)
@@ -2667,13 +2672,75 @@ class EngineServer(object):
 
     def _image(self, name):
         try:
-            ref = ParseNormalizedNamed(name).String()
+            ref = image_key(name)
         except ValueError as exc:
             raise ServerError(400, str(exc))
         image = self.state["images"].get(ref)
         if image is None:
             raise ServerError(404, "image not known")
         return ref, image
+
+    def _blob(self, client, digest):
+        """A blob from the local blob cache if it is there and intact, else from the registry."""
+        path = os.path.join(self.home, "blobs", digest.replace(":", "/"))
+        if os.path.exists(path):
+            with io.open(path, "rb") as fh:
+                data = fh.read()
+            if Digest(data) == digest:
+                return data
+        data = client.blob(digest)
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        with io.open(path, "wb") as fh:
+            fh.write(data)
+        return data
+
+    def image_pull(self, reference):
+        """Pulls an image into the store: its layers unpacked into a rootfs directory, its
+        config (environment, command, working directory) kept. Returns (key, image id)."""
+        try:
+            named = ParseNormalizedNamed(reference)
+            key = image_key(reference)
+        except ValueError as exc:
+            raise ServerError(400, str(exc))
+        if isinstance(named, Digested):
+            selector = named.Digest()
+        elif isinstance(named, Tagged):
+            selector = named.Tag()
+        else:
+            selector = "latest"
+        host = REGISTRY_HOST_ALIASES.get(named.Domain(), named.Domain())
+        client = RegistryClient(host, named.Path())
+        try:
+            digest, media, body = client.manifest(selector)
+            chosen = choose_manifest(media, body)
+            if chosen is not None:
+                digest, media, body = client.manifest(chosen)
+            manifest = json.loads(body.decode("utf-8"))
+            config_digest = manifest["config"]["digest"]
+            config = json.loads(self._blob(client, config_digest).decode("utf-8"))
+            image_id = config_digest[len("sha256:"):]
+            rootfs = os.path.join(self.home, "images", image_id, "rootfs")
+            if not os.path.isdir(rootfs):
+                staging = rootfs + ".partial"
+                if os.path.exists(staging):
+                    shutil.rmtree(staging)
+                os.makedirs(staging)
+                for layer in manifest.get("layers") or []:
+                    apply_layer(self._blob(client, layer["digest"]), staging)
+                os.rename(staging, rootfs)
+        except (RegistryError, ManifestError, NotImplementedError, ValueError, KeyError) as exc:
+            raise ServerError(500, "pull %s: %s" % (reference, exc))
+        cfg = config.get("config") or {}
+        with self.lock:
+            self.state["images"][key] = {
+                "Id": image_id, "Created": time.time(), "Size": directory_size(rootfs),
+                "rootfs": rootfs, "Env": cfg.get("Env") or [],
+                "Cmd": cfg.get("Cmd") or [], "Entrypoint": cfg.get("Entrypoint") or [],
+                "WorkingDir": cfg.get("WorkingDir") or "",
+                "RepoDigests": ["%s@%s" % (named.Name(), digest)]}
+            self._save()
+        return key, image_id
 
     # --- pods ------------------------------------------------------------------
 
@@ -2806,7 +2873,9 @@ class EngineServer(object):
         image_ref, image = self._image(spec.get("image") or "")
         command = list(spec.get("command") or [])
         if not command:
-            raise ServerError(400, "pmpy needs an explicit command (images have no default yet)")
+            command = list(image.get("Entrypoint") or []) + list(image.get("Cmd") or [])
+        if not command:
+            raise ServerError(400, "no command given and the image has none")
         network = spec.get("network") or "host"
         if network not in ENGINE_NETWORKS:
             raise ServerError(501, "pmpy does not implement network mode %s (host or none)" % network)
@@ -2825,10 +2894,11 @@ class EngineServer(object):
             name = spec.get("name") or cid[:12]
             if any(c["name"] == name for c in self.state["containers"].values()):
                 raise ServerError(409, "the name %s is already in use" % name)
-            env = dict(item.split("=", 1) if "=" in item else (item, "") for item in OCI_DEFAULT_ENV)
+            env = dict(item.split("=", 1) if "=" in item else (item, "")
+                       for item in list(OCI_DEFAULT_ENV) + list(image.get("Env") or []))
             env.update(spec.get("env") or {})
             env_list = ["%s=%s" % (k, v) for k, v in sorted(env.items())]
-            work_dir = spec.get("work_dir") or "/"
+            work_dir = spec.get("work_dir") or image.get("WorkingDir") or "/"
             mounts = []
             for mount in spec.get("mounts") or []:
                 source = os.path.abspath(mount.get("source", ""))
@@ -2838,7 +2908,8 @@ class EngineServer(object):
                                "source": source, "options": mount.get("options") or ["rw"]})
             bundle = os.path.join(self.home, "bundles", cid)
             os.makedirs(bundle)
-            os.symlink(image["rootfs"], os.path.join(bundle, "rootfs"))
+            # each container gets its own copy of the image (vfs: no shared layers yet)
+            shutil.copytree(image["rootfs"], os.path.join(bundle, "rootfs"), symlinks=True)
             oci = make_spec(command, env=env_list, cwd=work_dir, hostname=cid[:12], network=network)
             oci["mounts"].extend(mounts)
             write_bundle(bundle, oci)
@@ -3208,15 +3279,22 @@ class EngineServer(object):
     def h_delete_image(self, groups, query, body):
         ref, image = self._image(unquote(groups[0]))
         with self.lock:
-            if os.path.lexists(image["rootfs"]):
-                os.remove(image["rootfs"])
             del self.state["images"][ref]
+            shared = any(other["Id"] == image["Id"] for other in self.state["images"].values())
+            if not shared:
+                if os.path.islink(image["rootfs"]):
+                    os.remove(image["rootfs"])
+                elif os.path.isdir(image["rootfs"]):
+                    shutil.rmtree(os.path.dirname(image["rootfs"]), ignore_errors=True)
             self._save()
         return self._json([{"Untagged": ref}])
 
     def h_pull(self, groups, query, body):
-        raise ServerError(501, "pmpy has no image pull yet; import a rootfs with "
-                               "pmpy_server.py image-import NAME ROOTFS")
+        reference = query["reference"][0] if "reference" in query else ""
+        if not reference:
+            raise ServerError(400, "pull needs a reference")
+        key, image_id = self.image_pull(reference)
+        return self._json({"id": image_id, "images": [key]})
 
 
 class EngineHTTPHandler(BaseHTTPRequestHandler):
@@ -3266,6 +3344,276 @@ class EngineUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServe
         socketserver.UnixStreamServer.__init__(self, socket_path, EngineHTTPHandler)
         os.chmod(socket_path, 0o660)
         self.engine = engine
+
+
+# ===========================================================================
+# Part 11: pulling images from a registry (roadmap 1.3 and 1.5). RegistryClient
+#          speaks the registry v2 API with bearer tokens, which docker.io and most
+#          registries use. A manifest list or an OCI index is resolved to this
+#          machine's platform with the functions of part 6. Blobs are checked
+#          against their digest. Layers are applied in order to a rootfs directory,
+#          with whiteouts; symlinks on the way to an entry are followed inside the
+#          rootfs only, as a chroot would. Not here: zstd layers, schema 1, basic
+#          auth, mirrors, credentials, insecure registries, and layers that are
+#          streamed to disk (they are read into memory).
+# ===========================================================================
+
+REGISTRY_ACCEPT = ", ".join([OCI1_INDEX_MEDIA_TYPE, DOCKER_V2_LIST_MEDIA_TYPE,
+                             OCI1_MANIFEST_MEDIA_TYPE, DOCKER_V2_SCHEMA2_MEDIA_TYPE])
+REGISTRY_HOST_ALIASES = {"docker.io": "registry-1.docker.io"}
+REGISTRY_TIMEOUT = 60
+LAYER_MAX_SYMLINKS = 40
+
+
+class RegistryError(RuntimeError):
+    """A registry or pull failed. The message says what the registry answered."""
+
+
+def image_key(name):
+    """The name an image is stored under: the normalized reference, with :latest if it has
+    neither a tag nor a digest."""
+    named = ParseNormalizedNamed(name)
+    key = named.String()
+    if not isinstance(named, (Tagged, Digested)):
+        key += ":latest"
+    return key
+
+
+def parse_challenge(value):
+    """WWW-Authenticate: Bearer realm="...",service="...". Returns (scheme, params)."""
+    scheme, _, rest = value.strip().partition(" ")
+    params = {}
+    for match in re.finditer(r'([A-Za-z_]+)="([^"]*)"', rest):
+        params[match.group(1)] = match.group(2)
+    return scheme.lower(), params
+
+
+def _lower_headers(headers):
+    return dict((k.lower(), v) for k, v in headers.items())
+
+
+class RegistryClient(object):
+    """The registry v2 API for one repository, anonymous, with bearer tokens."""
+
+    def __init__(self, host, repository, scheme=None, timeout=REGISTRY_TIMEOUT):
+        self.host = host
+        self.repository = repository
+        if scheme is None:
+            local = host.split(":")[0] in ("localhost", "127.0.0.1")
+            scheme = "http" if local else "https"
+        self.base = "%s://%s/v2/" % (scheme, host)
+        self.timeout = timeout
+        self.token = None
+
+    def _request(self, url, headers):
+        try:
+            response = urlopen(Request(url, headers=headers), timeout=self.timeout)
+            return response.getcode(), _lower_headers(response.headers), response.read()
+        except HTTPError as exc:
+            return exc.code, _lower_headers(exc.headers), exc.read()
+        except (IOError, OSError) as exc:  # URLError is one of these
+            raise RegistryError("cannot reach %s: %s" % (self.host, exc))
+
+    def _authorize(self, challenge):
+        scheme, params = parse_challenge(challenge)
+        if scheme != "bearer" or "realm" not in params:
+            raise RegistryError("%s wants %s authentication; only bearer tokens are supported"
+                                % (self.host, scheme or "no"))
+        query = [("scope", "repository:%s:pull" % self.repository)]
+        if "service" in params:
+            query.insert(0, ("service", params["service"]))
+        status, _, body = self._request(params["realm"] + "?" + urlencode(query), {})
+        if status != 200:
+            raise RegistryError("token request for %s failed: HTTP %d" % (self.repository, status))
+        answer = json.loads(body.decode("utf-8"))
+        self.token = answer.get("token") or answer.get("access_token")
+        if not self.token:
+            raise RegistryError("the token service gave no token")
+
+    def get(self, path, accept=None):
+        """GET under /v2/. Returns (headers, body). A 401 asks for a token once."""
+        url = self.base + path
+        headers = {}
+        if accept:
+            headers["Accept"] = accept
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        status, hdrs, body = self._request(url, headers)
+        if status == 401 and self.token is None:
+            self._authorize(hdrs.get("www-authenticate", ""))
+            headers["Authorization"] = "Bearer " + self.token
+            status, hdrs, body = self._request(url, headers)
+        if status == 401:
+            raise RegistryError("%s: access denied for %s" % (self.host, path))
+        if status == 404:
+            raise RegistryError("%s: %s not found" % (self.host, path))
+        if status != 200:
+            raise RegistryError("%s: HTTP %d for %s" % (self.host, status, path))
+        return hdrs, body
+
+    def manifest(self, reference):
+        """The manifest for a tag or a digest: (digest, media type, bytes)."""
+        headers, body = self.get("%s/manifests/%s" % (self.repository, reference), REGISTRY_ACCEPT)
+        digest = Digest(body)
+        announced = headers.get("docker-content-digest")
+        if announced and announced != digest:
+            raise RegistryError("manifest %s: the digest does not match its content" % reference)
+        media = (headers.get("content-type") or "").split(";")[0].strip()
+        return digest, media or GuessMIMEType(body), body
+
+    def blob(self, digest):
+        """A blob by its digest, checked against it. Only sha256 digests are checked."""
+        if not digest.startswith("sha256:"):
+            raise RegistryError("blob %s: only sha256 digests are supported" % digest)
+        _, body = self.get("%s/blobs/%s" % (self.repository, digest))
+        if Digest(body) != digest:
+            raise RegistryError("blob %s: the digest does not match its content" % digest)
+        return body
+
+
+def choose_manifest(media, body, ctx=None):
+    """The digest of the manifest to use for this machine if the one given is an index or a
+    manifest list (part 6 picks the entry). None for a manifest itself."""
+    if media == OCI1_INDEX_MEDIA_TYPE:
+        chooser = OCI1IndexChooseInstance
+    elif media == DOCKER_V2_LIST_MEDIA_TYPE:
+        chooser = Schema2ListChooseInstance
+    else:
+        return None
+    try:
+        index = json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise RegistryError("the image index is not valid JSON")
+    return chooser(index.get("manifests") or [], ctx)
+
+
+def _tar_bytes(blob):
+    """The tar stream of a layer: gzip is removed, a plain tar is kept."""
+    if blob[:4] == b"\x28\xb5\x2f\xfd":
+        raise RegistryError("zstd layers are not supported yet")
+    if blob[:2] == b"\x1f\x8b":
+        return gzip.GzipFile(fileobj=io.BytesIO(blob)).read()
+    return blob
+
+
+def resolve_in_root(root, parts):
+    """The directory on disk for the path components parts, below root. Symlinks on the way
+    are followed inside root only: an absolute link starts again at root, and ".." cannot
+    leave it. The last component of a layer entry is not resolved (see apply_layer)."""
+    current = []
+    queue = list(parts)
+    hops = 0
+    while queue:
+        part = queue.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if current:
+                current.pop()
+            continue
+        here = os.path.join(root, *(current + [part]))
+        if os.path.islink(here):
+            hops += 1
+            if hops > LAYER_MAX_SYMLINKS:
+                raise RegistryError("too many symbolic links in a layer")
+            target = os.readlink(here)
+            if target.startswith("/"):
+                current = []
+            queue = target.split("/") + queue
+            continue
+        current.append(part)
+    return os.path.join(root, *current)
+
+
+def _remove(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _clear(path):
+    """Removes whatever is at path, if anything."""
+    if os.path.lexists(path):
+        _remove(path)
+
+
+def _own(path, member):
+    """Gives the entry the owner from the layer. Only root can do that; others keep theirs."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            os.lchown(path, member.uid, member.gid)
+        except OSError:
+            pass
+
+
+def _name_parts(name):
+    return [p for p in name.split("/") if p not in ("", ".")]
+
+
+def apply_layer(blob, rootfs):
+    """Unpacks one layer over rootfs: files, directories, links, and whiteouts that remove what
+    the layers below put there. Device nodes are skipped (they need privileges)."""
+    tar = tarfile.open(fileobj=io.BytesIO(_tar_bytes(blob)), mode="r:")
+    try:
+        members = tar.getmembers()
+        # an opaque whiteout empties its directory before the layer's own entries go in
+        members.sort(key=lambda m: _name_parts(m.name)[-1:] != [".wh..wh..opq"])
+        for member in members:
+            parts = _name_parts(member.name)
+            if not parts:
+                continue
+            name = parts[-1]
+            try:
+                parent = resolve_in_root(rootfs, parts[:-1])
+                if not os.path.isdir(parent):
+                    os.makedirs(parent)
+                if name == ".wh..wh..opq":
+                    for child in os.listdir(parent):
+                        _remove(os.path.join(parent, child))
+                    continue
+                if name.startswith(".wh."):
+                    _remove(os.path.join(parent, name[4:]))
+                    continue
+                target = os.path.join(parent, name)
+                if member.isdir():
+                    if os.path.islink(target) or (os.path.lexists(target)
+                                                  and not os.path.isdir(target)):
+                        _remove(target)
+                    if not os.path.isdir(target):
+                        os.mkdir(target)
+                    os.chmod(target, member.mode & 0o7777)
+                elif member.isreg():
+                    _clear(target)
+                    source = tar.extractfile(member)
+                    with io.open(target, "wb") as fh:
+                        fh.write(source.read())
+                    os.chmod(target, member.mode & 0o7777)
+                elif member.issym():
+                    _clear(target)
+                    os.symlink(member.linkname, target)
+                elif member.islnk():
+                    link = _name_parts(member.linkname)
+                    source = os.path.join(resolve_in_root(rootfs, link[:-1]), link[-1])
+                    if not os.path.lexists(source):
+                        raise RegistryError("hard link to %s, which is not in the layers"
+                                            % member.linkname)
+                    _clear(target)
+                    if os.path.islink(source):  # never read through a link: copy the link
+                        os.symlink(os.readlink(source), target)
+                    else:
+                        shutil.copyfile(source, target)
+                        os.chmod(target, os.stat(source).st_mode & 0o7777)
+                elif member.isfifo():
+                    _clear(target)
+                    os.mkfifo(target)
+                else:
+                    continue
+                _own(target, member)
+            except OSError as exc:
+                raise RegistryError("layer entry %s: %s" % (member.name, exc))
+    finally:
+        tar.close()
 
 
 # ===========================================================================
