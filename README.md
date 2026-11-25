@@ -41,6 +41,8 @@ Not yet ported:
 | `podman_machine_os.py`         | Command line: `podman-machine-os` (version; the rest not implemented) |
 | `test_cli.py`                  | Tests of the command line programs |
 | `oci_run.py`                   | Runs one command in a rootfs with crun (or runc) through a minimal OCI bundle |
+| `pmpy_server.py`               | Engine server on a unix socket: containers and images, run through the OCI runtime |
+| `test_server.py`               | Tests of the engine server with the real client and a fake runtime |
 | `test_oci.py`                  | Tests of the runtime choice and the spec |
 | `test_engine.py`               | Tests of the remote commands against a fake libpod service on a unix socket |
 | `test_podmanlib.py`            | Unit tests |
@@ -123,6 +125,24 @@ is not ported yet.
 
 Limits: the spec has pid, ipc, uts and mount namespaces only, so the container shares the host's network;
 no cgroup limits, no volumes or ports, no detached containers yet.
+
+## Python engine server (replaces the Go server step by step)
+
+`pmpy_server.py` serves the part of the podman API that `podman.py` uses, on a unix socket. Containers run
+through the OCI runtime (crun, runc as fallback). Images come from a rootfs store filled with `image-import`.
+
+```bash
+python3 pmpy_server.py --home /var/lib/pmpy image-import alpine:3.20 /path/to/rootfs   # before serve
+python3 pmpy_server.py --home /var/lib/pmpy serve /run/pmpy.sock
+CONTAINER_HOST=unix:///run/pmpy.sock python3 podman.py run --rm alpine:3.20 uname -m
+```
+
+Works: create, start, wait, stop (TERM, then KILL), logs, inspect, list, rm (with -f for running containers),
+images, exists, exit status and output. Verified in a qbox box with crun 1.14.1.
+Not yet: pull (answers 501 with a hint), ports (accepted, with a warning, not published), networking, pods,
+restart, attach, volumes beyond bind mounts. Container state is one JSON file; containers that were
+running when the server stopped are reported as exited. Run image-import while the server is stopped,
+because the server keeps its own copy of the state.
 
 ## Usage
 

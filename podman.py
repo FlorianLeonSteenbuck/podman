@@ -422,6 +422,7 @@ def write_frames(data):
     for stream, payload in pl.demux_frames(data):
         target = sys.stderr if stream == 2 else sys.stdout
         target.write(payload.decode("utf-8", "replace"))
+        target.flush()
 
 
 def cmd_logs(client, args):

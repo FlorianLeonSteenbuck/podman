@@ -12,6 +12,7 @@ Ported so far
   Part 4  container-libs image/docker/reference     (image name parsing)
   Part 6  image manifests: media types, digest, the platform of this machine,
           choosing an image from an OCI index or a Docker manifest list
+  Part 10 engine server: containers and images on a unix socket, through the OCI runtime
   Part 9  OCI runtime: crun first, runc second; spec and bundle; calls the runtime program
   Part 7  command line helpers: flags without argparse, exit status, not-implemented
   Part 8  container engine client: libpod REST API over a unix socket, output formats
@@ -46,15 +47,22 @@ import re
 import subprocess
 import sys
 import socket
+import socketserver
 import tempfile
+import threading
+import time
+import shutil
 from collections import OrderedDict
 
 try:  # Python 3
     import http.client as httpclient
-    from urllib.parse import quote as url_quote, urlencode
+    from http.server import BaseHTTPRequestHandler
+    from urllib.parse import quote as url_quote, urlencode, unquote, parse_qs
 except ImportError:  # Python 2
     import httplib as httpclient
-    from urllib import quote as url_quote, urlencode
+    from BaseHTTPServer import BaseHTTPRequestHandler
+    from urllib import quote as url_quote, urlencode, unquote
+    from urlparse import parse_qs
 
 
 # ===========================================================================
@@ -2304,6 +2312,447 @@ class OCIRuntime(object):
         """create, start and wait in one call. Returns (exit status, stdout, stderr)."""
         result = run([self.path, "run", "--bundle", bundle, container_id])
         return result.returncode, result.stdout, result.stderr
+
+
+# ===========================================================================
+# Part 10: a small engine server. It serves the part of the libpod REST API that
+#          podman.py uses, on a unix socket: containers (create, start, wait, stop,
+#          logs, inspect, list, delete) and images from a local rootfs store.
+#          Containers run through the OCI runtime of part 9. Everything else answers
+#          501 (not implemented). No pull, no networking, no pods, no restart. The
+#          state is one JSON file; containers that were running when the server
+#          stopped are reported as exited.
+# ===========================================================================
+
+ENGINE_API_VERSION = "4.9.0"
+ENGINE_VERSION = "0.1.0-pmpy"
+ENGINE_STOP_TIMEOUT = 10
+
+
+class ServerError(Exception):
+    """An error answer: HTTP status and the message podman prints."""
+
+    def __init__(self, status, message):
+        Exception.__init__(self, message)
+        self.status = status
+        self.message = message
+
+
+def rfc3339(epoch):
+    if not epoch:
+        return "0001-01-01T00:00:00Z"
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def parse_query(query):
+    return parse_qs(query, keep_blank_values=True)
+
+
+def new_container_id():
+    return hashlib.sha256(os.urandom(32)).hexdigest()
+
+
+def directory_size(path):
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            if not os.path.islink(full):
+                total += os.path.getsize(full)
+    return total
+
+
+class EngineServer(object):
+    """Containers and images in one JSON state file under home, run through an OCI runtime."""
+
+    def __init__(self, home, runtime_path=None):
+        self.home = os.path.abspath(home)
+        self.runtime_path = runtime_path
+        self._runtime = None
+        self.lock = threading.RLock()
+        self.done = {}  # container id -> Event, for containers this process started
+        for sub in ("bundles", "logs", "rootfs"):
+            path = os.path.join(self.home, sub)
+            if not os.path.isdir(path):
+                os.makedirs(path)
+        self.state_path = os.path.join(self.home, "state.json")
+        self.state = {"containers": {}, "images": {}}
+        if os.path.exists(self.state_path):
+            with io.open(self.state_path, encoding="utf-8") as fh:
+                self.state = json.loads(fh.read())
+        for c in self.state["containers"].values():
+            if c["status"] == "running":
+                c["status"] = "exited"
+                c["exit_code"] = -1
+                c["finished"] = time.time()
+        self._save()
+
+    # --- state file ------------------------------------------------------------
+
+    def _save(self):
+        tmp = self.state_path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(self.state, indent=2, sort_keys=True) + "\n")
+        os.rename(tmp, self.state_path)
+
+    def runtime(self):
+        if self._runtime is None:
+            try:
+                self._runtime = OCIRuntime(self.runtime_path)
+            except OCIRuntimeError as exc:
+                raise ServerError(500, str(exc))
+        return self._runtime
+
+    # --- images ----------------------------------------------------------------
+
+    def image_import(self, name, rootfs):
+        """Makes rootfs (a directory) an image under the normalized name. Returns that name."""
+        try:
+            ref = ParseNormalizedNamed(name).String()
+        except ValueError as exc:
+            raise ServerError(400, str(exc))
+        rootfs = os.path.abspath(rootfs)
+        if not os.path.isdir(rootfs):
+            raise ServerError(400, "no root filesystem at %s" % rootfs)
+        link = os.path.join(self.home, "rootfs", hashlib.sha256(ref.encode("utf-8")).hexdigest()[:24])
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(rootfs, link)
+        with self.lock:
+            self.state["images"][ref] = {
+                "Id": hashlib.sha256((ref + rootfs).encode("utf-8")).hexdigest(),
+                "Created": time.time(), "Size": directory_size(rootfs), "rootfs": link}
+            self._save()
+        return ref
+
+    def _image(self, name):
+        try:
+            ref = ParseNormalizedNamed(name).String()
+        except ValueError as exc:
+            raise ServerError(400, str(exc))
+        image = self.state["images"].get(ref)
+        if image is None:
+            raise ServerError(404, "image not known")
+        return ref, image
+
+    # --- containers ------------------------------------------------------------
+
+    def _container(self, key):
+        containers = self.state["containers"]
+        if key in containers:
+            return containers[key]
+        for c in containers.values():
+            if c["name"] == key:
+                return c
+        matches = [c for cid, c in containers.items() if len(key) >= 4 and cid.startswith(key)]
+        if len(matches) == 1:
+            return matches[0]
+        raise ServerError(404, "no container with name or ID %s found: no such container" % key)
+
+    def container_json(self, c):
+        return {
+            "Id": c["id"], "Name": c["name"], "Image": c["image"],
+            "Created": rfc3339(c["created"]),
+            "Config": {"Cmd": c["command"], "Env": c["env"], "WorkingDir": c["work_dir"]},
+            "State": {"Status": c["status"], "Running": c["status"] == "running",
+                      "ExitCode": c["exit_code"], "StartedAt": rfc3339(c["started"]),
+                      "FinishedAt": rfc3339(c["finished"]), "Pid": 0},
+            "Mounts": c["mounts"],
+        }
+
+    def list_entry(self, c):
+        return {
+            "Id": c["id"], "Names": [c["name"]], "Image": c["image"], "Command": c["command"],
+            "Created": rfc3339(c["created"]), "State": c["status"], "Status": "",
+            "StartedAt": int(c["started"] or 0), "ExitedAt": int(c["finished"] or 0),
+            "ExitCode": c["exit_code"], "Exited": c["status"] == "exited",
+            "Ports": [dict(p, host_ip=p.get("host_ip", "")) for p in c["ports"]],
+            "PodName": "", "Labels": None,
+        }
+
+    def create(self, spec):
+        image_ref, image = self._image(spec.get("image") or "")
+        command = list(spec.get("command") or [])
+        if not command:
+            raise ServerError(400, "pmpy needs an explicit command (images have no default yet)")
+        name = spec.get("name") or ""
+        with self.lock:
+            cid = new_container_id()
+            if not name:
+                name = cid[:12]
+            if any(c["name"] == name for c in self.state["containers"].values()):
+                raise ServerError(409, "the name %s is already in use" % name)
+            env = dict(item.split("=", 1) if "=" in item else (item, "") for item in OCI_DEFAULT_ENV)
+            env.update(spec.get("env") or {})
+            env_list = ["%s=%s" % (k, v) for k, v in sorted(env.items())]
+            work_dir = spec.get("work_dir") or "/"
+            mounts = []
+            for mount in spec.get("mounts") or []:
+                source = os.path.abspath(mount.get("source", ""))
+                if not os.path.exists(source):
+                    raise ServerError(400, "mount source %s does not exist" % source)
+                mounts.append({"destination": mount["destination"], "type": "bind",
+                               "source": source, "options": mount.get("options") or ["rw"]})
+            bundle = os.path.join(self.home, "bundles", cid)
+            os.makedirs(bundle)
+            os.symlink(image["rootfs"], os.path.join(bundle, "rootfs"))
+            oci = make_spec(command, env=env_list, cwd=work_dir, hostname=cid[:12])
+            oci["mounts"].extend(mounts)
+            write_bundle(bundle, oci)
+            ports = spec.get("portmappings") or []
+            self.state["containers"][cid] = {
+                "id": cid, "name": name, "image": image_ref, "command": command,
+                "env": env_list, "work_dir": work_dir, "created": time.time(), "started": 0,
+                "finished": 0, "status": "created", "exit_code": 0, "ports": ports,
+                "mounts": mounts, "bundle": bundle}
+            self._save()
+        warnings = ["ports are not published by pmpy yet"] if ports else []
+        return cid, warnings
+
+    def start(self, key):
+        c = self._container(key)
+        with self.lock:
+            if c["status"] == "running":
+                return
+            if c["status"] not in ("created", "exited"):
+                raise ServerError(409, "container %s cannot be started" % c["name"])
+            c["status"] = "running"
+            c["started"] = time.time()
+            c["finished"] = 0
+            event = threading.Event()
+            self.done[c["id"]] = event
+            self._save()
+        thread = threading.Thread(target=self._run, args=(c["id"], event))
+        thread.daemon = True
+        thread.start()
+
+    def _run(self, cid, event):
+        c = self.state["containers"][cid]
+        code, out, err = self.runtime().run(cid, c["bundle"])
+        logs = os.path.join(self.home, "logs")
+        with io.open(os.path.join(logs, cid + ".stdout"), "wb") as fh:
+            fh.write(out.encode("utf-8") if not isinstance(out, bytes) else out)
+        with io.open(os.path.join(logs, cid + ".stderr"), "wb") as fh:
+            fh.write(err.encode("utf-8") if not isinstance(err, bytes) else err)
+        with self.lock:
+            c["status"] = "exited"
+            c["exit_code"] = code
+            c["finished"] = time.time()
+            self._save()
+        event.set()
+
+    def stop(self, key, timeout):
+        c = self._container(key)
+        if c["status"] != "running":
+            return
+        event = self.done.get(c["id"])
+        self.runtime().kill(c["id"], "TERM")
+        if event is not None and not event.wait(timeout):
+            self.runtime().kill(c["id"], "KILL")
+            event.wait(ENGINE_STOP_TIMEOUT)
+
+    def wait(self, key):
+        c = self._container(key)
+        event = self.done.get(c["id"])
+        if c["status"] == "running" and event is not None:
+            event.wait()
+        return c["exit_code"]
+
+    def logs(self, key):
+        c = self._container(key)
+        frames = bytearray()
+        for stream, suffix in ((1, ".stdout"), (2, ".stderr")):
+            path = os.path.join(self.home, "logs", c["id"] + suffix)
+            if not os.path.exists(path):
+                continue
+            with io.open(path, "rb") as fh:
+                payload = fh.read()
+            size = len(payload)
+            frames.extend(bytearray([stream, 0, 0, 0, (size >> 24) & 255, (size >> 16) & 255,
+                                     (size >> 8) & 255, size & 255]))
+            frames.extend(payload)
+        return bytes(frames)
+
+    def delete(self, key, force):
+        c = self._container(key)
+        with self.lock:
+            if c["status"] == "running":
+                if not force:
+                    raise ServerError(409, "container %s is running; use force" % c["name"])
+                self.stop(c["id"], 0)
+            shutil.rmtree(c["bundle"], ignore_errors=True)
+            for suffix in (".stdout", ".stderr"):
+                path = os.path.join(self.home, "logs", c["id"] + suffix)
+                if os.path.exists(path):
+                    os.remove(path)
+            del self.state["containers"][c["id"]]
+            self._save()
+
+    # --- HTTP answers ----------------------------------------------------------
+
+    def handle(self, method, raw_path, body):
+        """Returns (status, content type, body bytes) for one request."""
+        path, _, query = raw_path.partition("?")
+        path = re.sub(r"^/v[0-9][0-9.]*(?=/)", "", path)
+        try:
+            for route_method, pattern, handler in self.routes():
+                if route_method != method:
+                    continue
+                match = re.match(pattern, path)
+                if match is not None:
+                    return handler(match.groups(), parse_query(query), body)
+            if path.startswith("/libpod/"):
+                raise ServerError(501, "pmpy does not implement %s %s yet" % (method, path))
+            return 404, "text/plain", b"Not Found"
+        except ServerError as exc:
+            data = json.dumps({"cause": exc.message, "message": exc.message,
+                               "response": exc.status}).encode("utf-8")
+            return exc.status, "application/json", data
+        except (ValueError, KeyError, TypeError) as exc:
+            data = json.dumps({"cause": str(exc), "message": str(exc),
+                               "response": 400}).encode("utf-8")
+            return 400, "application/json", data
+
+    def routes(self):
+        return [
+            ("GET", r"^/_ping$", self.h_ping),
+            ("HEAD", r"^/_ping$", self.h_ping),
+            ("GET", r"^/(libpod/)?version$", self.h_version),
+            ("GET", r"^/libpod/containers/json$", self.h_list_containers),
+            ("POST", r"^/libpod/containers/create$", self.h_create),
+            ("GET", r"^/libpod/containers/([^/]+)/json$", self.h_inspect_container),
+            ("POST", r"^/libpod/containers/([^/]+)/start$", self.h_start),
+            ("POST", r"^/libpod/containers/([^/]+)/stop$", self.h_stop),
+            ("POST", r"^/libpod/containers/([^/]+)/wait$", self.h_wait),
+            ("GET", r"^/libpod/containers/([^/]+)/logs$", self.h_logs),
+            ("DELETE", r"^/libpod/containers/([^/]+)$", self.h_delete),
+            ("GET", r"^/libpod/images/json$", self.h_list_images),
+            ("GET", r"^/libpod/images/([^/]+)/exists$", self.h_image_exists),
+            ("GET", r"^/libpod/images/([^/]+)/json$", self.h_inspect_image),
+            ("DELETE", r"^/libpod/images/([^/]+)$", self.h_delete_image),
+            ("POST", r"^/libpod/images/pull$", self.h_pull),
+        ]
+
+    def _json(self, obj, status=200):
+        return status, "application/json", json.dumps(obj).encode("utf-8")
+
+    def _key(self, groups):
+        return unquote(groups[0])
+
+    def h_ping(self, groups, query, body):
+        return 200, "text/plain", b"OK"
+
+    def h_version(self, groups, query, body):
+        return self._json({
+            "Platform": {"Name": "linux/%s" % host_goarch()},
+            "Components": [{"Name": "Podman Engine", "Version": ENGINE_VERSION,
+                            "Details": {"APIVersion": ENGINE_API_VERSION,
+                                        "MinAPIVersion": ENGINE_API_VERSION}}]})
+
+    def h_list_containers(self, groups, query, body):
+        everything = "all" in query and query["all"][0] not in ("false", "0")
+        with self.lock:
+            rows = [self.list_entry(c) for c in self.state["containers"].values()
+                    if everything or c["status"] == "running"]
+        return self._json(sorted(rows, key=lambda r: r["Names"][0]))
+
+    def h_create(self, groups, query, body):
+        spec = json.loads(body.decode("utf-8")) if body else {}
+        cid, warnings = self.create(spec)
+        return self._json({"Id": cid, "Warnings": warnings}, 201)
+
+    def h_inspect_container(self, groups, query, body):
+        return self._json(self.container_json(self._container(self._key(groups))))
+
+    def h_start(self, groups, query, body):
+        self.start(self._key(groups))
+        return 204, "text/plain", b""
+
+    def h_stop(self, groups, query, body):
+        timeout = int(query["timeout"][0]) if "timeout" in query else ENGINE_STOP_TIMEOUT
+        self.stop(self._key(groups), timeout)
+        return 204, "text/plain", b""
+
+    def h_wait(self, groups, query, body):
+        return self._json(self.wait(self._key(groups)))
+
+    def h_logs(self, groups, query, body):
+        return 200, "application/vnd.docker.raw-stream", self.logs(self._key(groups))
+
+    def h_delete(self, groups, query, body):
+        force = "force" in query and query["force"][0] in ("true", "1")
+        self.delete(self._key(groups), force)
+        return 204, "text/plain", b""
+
+    def h_list_images(self, groups, query, body):
+        rows = []
+        for ref, image in sorted(self.state["images"].items()):
+            rows.append({"Id": image["Id"], "RepoTags": [ref], "Names": [ref],
+                         "Created": int(image["Created"]), "Size": image["Size"]})
+        return self._json(rows)
+
+    def h_image_exists(self, groups, query, body):
+        try:
+            self._image(unquote(groups[0]))
+        except ServerError:
+            return 404, "text/plain", b""
+        return 204, "text/plain", b""
+
+    def h_inspect_image(self, groups, query, body):
+        ref, image = self._image(unquote(groups[0]))
+        return self._json({"Id": image["Id"], "RepoTags": [ref], "Created": rfc3339(image["Created"]),
+                           "Size": image["Size"], "Architecture": host_goarch(), "Os": "linux"})
+
+    def h_delete_image(self, groups, query, body):
+        ref, image = self._image(unquote(groups[0]))
+        with self.lock:
+            if os.path.lexists(image["rootfs"]):
+                os.remove(image["rootfs"])
+            del self.state["images"][ref]
+            self._save()
+        return self._json([{"Untagged": ref}])
+
+    def h_pull(self, groups, query, body):
+        raise ServerError(501, "pmpy has no image pull yet; import a rootfs with "
+                               "pmpy_server.py image-import NAME ROOTFS")
+
+
+class EngineHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP/1.0 over the unix socket; the answer comes from EngineServer.handle."""
+
+    def _answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        status, content_type, data = self.server.engine.handle(self.command, self.path, body)
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("API-Version", ENGINE_API_VERSION)
+        self.end_headers()
+        if self.command != "HEAD" and data:
+            self.wfile.write(data)
+
+    do_GET = _answer
+    do_POST = _answer
+    do_DELETE = _answer
+    do_HEAD = _answer
+
+    def address_string(self):
+        return "unix"
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class EngineUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, socket_path, engine):
+        if os.path.exists(socket_path):
+            os.remove(socket_path)
+        socketserver.UnixStreamServer.__init__(self, socket_path, EngineHTTPHandler)
+        os.chmod(socket_path, 0o660)
+        self.engine = engine
 
 
 # ===========================================================================
