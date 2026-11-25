@@ -1942,15 +1942,53 @@ def _error_message(data, status):
     return text or "HTTP %d" % status
 
 
+def engine_api_version(info):
+    """The API version a /version or /libpod/version answer reports ("" if none)."""
+    for component in info.get("Components") or []:
+        if component.get("Name") == "Podman Engine":
+            return (component.get("Details") or {}).get("APIVersion", "")
+    return info.get("ApiVersion", "")
+
+
+def engine_version(info):
+    """The engine version from a version answer ("" if none)."""
+    for component in info.get("Components") or []:
+        if component.get("Name") == "Podman Engine":
+            return component.get("Version", "")
+    return info.get("Version", "")
+
+
 class EngineClient(object):
-    """Libpod REST client. Paths are unversioned; the server accepts them."""
+    """Libpod REST client.
+
+    Podman 4.x only routes paths with the API version in front (/v4.9.0/libpod/...).
+    The version comes from /version, which is not versioned. /_ping and /version are
+    used as they are.
+    """
 
     def __init__(self, socket_path, timeout=60):
         self.socket_path = socket_path
         self.timeout = timeout
+        self._prefix = None
+
+    def prefix(self):
+        if self._prefix is None:
+            prefix = ""
+            try:
+                status, data = self.request("GET", "/version")
+                if status == 200 and data:
+                    api = engine_api_version(json.loads(data.decode("utf-8", "replace")))
+                    if api:
+                        prefix = "/v" + api
+            except (ValueError, EngineError):
+                pass
+            self._prefix = prefix
+        return self._prefix
 
     def request(self, method, path, query=None, body=None):
         """Returns (status, body bytes). Socket errors become EngineError with status 0."""
+        if path.startswith("/libpod/"):
+            path = self.prefix() + path
         if query:
             pairs = []
             for key, value in sorted(query.items()):
@@ -2009,8 +2047,12 @@ class EngineClient(object):
         return status in (200, 204)
 
     def pull(self, reference, quiet=True):
+        """The server answers 200 even when the pull failed: the error is in the body."""
         _, data = self.call("POST", "/libpod/images/pull", {"reference": reference, "quiet": quiet})
-        return json.loads(data.decode("utf-8", "replace")) if data else {}
+        report = json.loads(data.decode("utf-8", "replace")) if data else {}
+        if isinstance(report, dict) and report.get("error"):
+            raise EngineError(500, str(report["error"]))
+        return report
 
     def container_action(self, name, action, query=None):
         """start, stop, restart (stop and restart take timeout in the query)."""
@@ -2054,6 +2096,58 @@ def demux_frames(data):
         frames.append((buf[i], bytes(buf[i + 8:i + 8 + size])))
         i += 8 + size
     return frames
+
+
+def human_size(num_bytes):
+    """Podman's size column: decimal units with two decimals, e.g. 9.12MB."""
+    size = float(num_bytes or 0)
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if size < 1000 or unit == "TB":
+            return ("%d%s" % (size, unit)) if unit == "B" else ("%.2f%s" % (size, unit))
+        size /= 1000.0
+    return "%dB" % size
+
+
+def epoch_of(value):
+    """Seconds since the epoch for an API timestamp: an RFC 3339 string or a number. None if unknown."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return None if value <= -62135596800 else float(value)
+    match = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$",
+                     str(value))
+    if match is None:
+        return None
+    import calendar as _calendar
+    import time as _time
+    stamp = _calendar.timegm(_time.strptime(match.group(1) + " " + match.group(2),
+                                            "%Y-%m-%d %H:%M:%S"))
+    frac = match.group(3)
+    return stamp + (float("0" + frac) if frac else 0.0)
+
+
+def time_ago(epoch, now=None):
+    """Relative time as podman prints it: "2 minutes ago", "3 weeks ago"."""
+    import time as _time
+    if epoch is None:
+        return ""
+    now = _time.time() if now is None else now
+    try:
+        seconds = int(now - float(epoch))
+    except (TypeError, ValueError):
+        return str(epoch)
+    for limit, unit in ((60, "second"), (3600, "minute"), (86400, "hour"),
+                        (86400 * 7, "day"), (86400 * 30, "week"), (86400 * 365, "month")):
+        if seconds < limit:
+            break
+    else:
+        return "%d years ago" % (seconds // (86400 * 365))
+    divisor = {"second": 1, "minute": 60, "hour": 3600, "day": 86400,
+               "week": 86400 * 7, "month": 86400 * 30}[unit]
+    count = max(seconds // divisor, 1)
+    if count < 2 and unit == "second":
+        return "Less than a second ago"
+    return "%d %s%s ago" % (count, unit, "" if count == 1 else "s")
 
 
 def format_table(headers, rows):

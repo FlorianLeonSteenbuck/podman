@@ -250,6 +250,26 @@ def normalize_short(args, mapping):
     return [mapping.get(arg, arg) for arg in args]
 
 
+def status_text(item):
+    """Podman's status column: "Up 2 minutes", "Exited (0) 3 seconds ago", or the state."""
+    state = item.get("State", "")
+    if state == "running":
+        return "Up " + pl.time_ago(pl.epoch_of(item.get("StartedAt")))[:-4] if item.get("StartedAt") else "Up"
+    if item.get("Exited") or state == "exited":
+        return "Exited (%s) %s" % (item.get("ExitCode", 0), pl.time_ago(pl.epoch_of(item.get("ExitedAt"))))
+    return item.get("Status", "") or state
+
+
+def ports_text(ports):
+    """0.0.0.0:18081->80/tcp, as podman prints it."""
+    parts = []
+    for port in ports or []:
+        host_ip = port.get("host_ip") or "0.0.0.0"
+        parts.append("%s:%s->%s/%s" % (host_ip, port.get("host_port", ""),
+                                      port.get("container_port", ""), port.get("protocol", "tcp")))
+    return ", ".join(parts)
+
+
 def container_view(item):
     """The fields of one container, under the names podman uses in --format."""
     names = item.get("Names") or []
@@ -258,9 +278,9 @@ def container_view(item):
         "ID": item.get("Id", ""),
         "Image": item.get("Image", ""),
         "Command": " ".join(command) if isinstance(command, list) else str(command),
-        "Created": item.get("Created", ""),
-        "Status": item.get("Status", "") or item.get("State", ""),
-        "Ports": item.get("Ports", "") or "",
+        "Created": pl.time_ago(pl.epoch_of(item.get("Created"))),
+        "Status": status_text(item),
+        "Ports": ports_text(item.get("Ports")),
         "Names": names[0] if names else "",
         "Pod": item.get("PodName", "") or "",
     }
@@ -279,8 +299,8 @@ def image_view(item):
         "ID": (item.get("Id") or "")[:12],
         "Repository": repository,
         "Tag": tag,
-        "Created": item.get("Created", ""),
-        "Size": item.get("Size", ""),
+        "Created": pl.time_ago(item.get("Created")),
+        "Size": pl.human_size(item.get("Size")),
     }
 
 
@@ -294,7 +314,7 @@ def cmd_ps(client, args):
             sys.stdout.write(pl.format_template(options["--format"], view) + "\n")
     else:
         headers = ["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"]
-        table = [[v["ID"][:12], v["Image"], v["Command"], str(v["Created"]), v["Status"],
+        table = [[v["ID"][:12], v["Image"], v["Command"], v["Created"], v["Status"],
                   v["Ports"], v["Names"]] for v in views]
         sys.stdout.write(pl.format_table(headers, table))
     return pl.EXIT_OK
@@ -320,7 +340,10 @@ def cmd_pull(client, args):
     if len(rest) != 1:
         raise pl.CliUsageError("usage: podman pull [-q] REFERENCE")
     report = client.pull(rest[0], quiet=True)
-    image_id = report.get("ID") or (report.get("Images") or [""])[-1]
+    image_id = report.get("id") or report.get("ID") or ""
+    if not image_id:
+        images = report.get("images") or report.get("Images") or []
+        image_id = images[-1] if images else ""
     sys.stdout.write(image_id + "\n")
     return pl.EXIT_OK
 
@@ -345,7 +368,12 @@ def cmd_inspect(client, args):
             if exc.status != 404 or wanted == "container":
                 raise
     if data is None:
-        data = client.inspect_image(name)
+        try:
+            data = client.inspect_image(name)
+        except pl.EngineError as exc:
+            if exc.status == 404:
+                raise pl.EngineError(404, "no such object: %s" % name)
+            raise
     if "--format" in options:
         sys.stdout.write(pl.format_template(options["--format"], data) + "\n")
     else:
@@ -406,7 +434,7 @@ def cmd_logs(client, args):
 def cmd_version_remote(client, args):
     options, _ = pl.take_flags(args, {"--format": "value"})
     info = client.version() or {}
-    view = {"Client": {"Version": VERSION}, "Server": {"Version": info.get("Version", "")}}
+    view = {"Client": {"Version": VERSION}, "Server": {"Version": pl.engine_version(info)}}
     if "--format" in options:
         sys.stdout.write(pl.format_template(options["--format"], view) + "\n")
     else:

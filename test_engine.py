@@ -8,8 +8,10 @@ from __future__ import absolute_import, print_function
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import threading
@@ -26,10 +28,17 @@ except ImportError:  # Python 2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+VERSION_INFO = {"Platform": {"Name": "linux/arm64/ubuntu-24.04"},
+                "Components": [{"Name": "Podman Engine", "Version": "4.9.3",
+                                "Details": {"APIVersion": "4.9.0", "MinAPIVersion": "4.0.0"}}]}
 CONTAINERS = [{"Id": "9f8e7d6c5b4a3210aabbccddeeff0011223344556677889900aabbccddeeff00",
                "Names": ["web"], "Image": "docker.io/library/alpine:3.20",
-               "Command": ["/bin/sh"], "Created": 1700000000, "Status": "Up 2 minutes",
-               "State": "running", "Ports": "", "PodName": ""}]
+               "Command": ["/bin/sh"], "Created": "2026-11-25T13:00:00.5Z",
+               "Status": "", "State": "running", "Exited": False, "ExitCode": 0,
+               "ExitedAt": -62135596800, "StartedAt": int(time.time()) - 120,
+               "Ports": [{"host_ip": "", "container_port": 80, "host_port": 18080,
+                          "range": 1, "protocol": "tcp"}],
+               "PodName": ""}]
 IMAGES = [{"Id": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
            "RepoTags": ["docker.io/library/alpine:3.20"], "Created": 1700000000, "Size": 7800000}]
 
@@ -58,16 +67,25 @@ class FakeLibpod(BaseHTTPRequestHandler):
     def json(self, status, obj):
         self.send(status, json.dumps(obj).encode("utf-8"))
 
+    def unversioned_libpod(self):
+        """Podman 4.9 answers /libpod/... only with the API version in front."""
+        return self.path.partition("?")[0].startswith("/libpod/")
+
     def route(self):
         path, _, query = self.path.partition("?")
-        return unquote(path), query
+        path = re.sub(r"^/v4\.9\.0(?=/)", "", unquote(path))
+        return path, query
 
     def do_GET(self):
+        if self.unversioned_libpod():
+            return self.send(404, b"Not Found", "text/plain")
         path, query = self.route()
         if path == "/_ping":
             return self.send(200, b"OK", "text/plain")
+        if path == "/version":
+            return self.json(200, VERSION_INFO)
         if path == "/libpod/version":
-            return self.json(200, {"Version": "4.9.3", "ApiVersion": "4.9.0"})
+            return self.json(200, VERSION_INFO)
         if path == "/libpod/containers/json":
             return self.json(200, CONTAINERS if "all=true" in query else [])
         if path == "/libpod/images/json":
@@ -89,6 +107,8 @@ class FakeLibpod(BaseHTTPRequestHandler):
         return self.json(404, {"message": "not found"})
 
     def do_POST(self):
+        if self.unversioned_libpod():
+            return self.send(404, b"Not Found", "text/plain")
         path, query = self.route()
         if path == "/libpod/containers/create":
             length = int(self.headers.get("Content-Length", "0"))
@@ -98,7 +118,9 @@ class FakeLibpod(BaseHTTPRequestHandler):
         if path == "/libpod/containers/run0001/wait":
             return self.json(200, 3)
         if path == "/libpod/images/pull":
-            return self.json(200, {"Images": [IMAGES[0]["Id"]], "ID": IMAGES[0]["Id"]})
+            if "missing" in query:
+                return self.json(200, {"error": "initializing source docker://missing/none:1: no such image"})
+            return self.json(200, {"images": [IMAGES[0]["Id"]], "id": IMAGES[0]["Id"]})
         if path in ("/libpod/containers/run0001/start",):
             return self.send(204)
         if path in ("/libpod/containers/web/start", "/libpod/containers/web/stop",
@@ -107,6 +129,8 @@ class FakeLibpod(BaseHTTPRequestHandler):
         return self.json(404, {"message": "not found"})
 
     def do_DELETE(self):
+        if self.unversioned_libpod():
+            return self.send(404, b"Not Found", "text/plain")
         path, query = self.route()
         if path == "/libpod/containers/web":
             return self.send(200 if "force=true" in query else 409, b"{}")
@@ -158,7 +182,15 @@ class EngineTest(unittest.TestCase):
     def test_ps_with_format_template(self):
         code, out, _ = self.run_podman(["ps", "-a", "--format", "{{.Names}}\\t{{.Image}}\\t{{.Status}}"])
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "web\tdocker.io/library/alpine:3.20\tUp 2 minutes")
+        names, image, status = out.strip().split("\t")
+        self.assertEqual((names, image), ("web", "docker.io/library/alpine:3.20"))
+        self.assertTrue(status.startswith("Up 2 minutes"), status)
+
+    def test_ps_table_shows_ports_and_status(self):
+        code, out, _ = self.run_podman(["ps", "-a"])
+        self.assertEqual(code, 0)
+        self.assertIn("0.0.0.0:18080->80/tcp", out)
+        self.assertIn("Up 2 minutes", out)
 
     def test_images_and_version(self):
         code, out, _ = self.run_podman(["images", "--format", "{{.Repository}}:{{.Tag}}"])
@@ -170,6 +202,9 @@ class EngineTest(unittest.TestCase):
         code, out, _ = self.run_podman(["pull", "-q", "alpine:3.20"])
         self.assertEqual(code, 0)
         self.assertTrue(out.strip().startswith("abcdef1234"))
+
+    def test_pull_error_in_body_is_a_failure(self):
+        self.assertEqual(self.run_podman(["pull", "missing/none:1"])[0], 1)
 
     def test_image_exists_and_inspect(self):
         self.assertEqual(self.run_podman(["image", "exists", "alpine:3.20"])[0], 0)
