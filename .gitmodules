@@ -1,0 +1,15 @@
+[submodule "repos/podman"]
+	path = repos/podman
+	url = https://github.com/podman-container-tools/podman.git
+[submodule "repos/container-libs"]
+	path = repos/container-libs
+	url = https://github.com/podman-container-tools/container-libs.git
+[submodule "repos/skopeo"]
+	path = repos/skopeo
+	url = https://github.com/podman-container-tools/skopeo.git
+[submodule "repos/buildah"]
+	path = repos/buildah
+	url = https://github.com/podman-container-tools/buildah.git
+[submodule "repos/podman-machine-os"]
+	path = repos/podman-machine-os
+	url = https://github.com/podman-container-tools/podman-machine-os.git
