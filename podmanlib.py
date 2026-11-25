@@ -10,6 +10,8 @@ Ported so far
   Part 2  go.mod reader                 own code, Go syntax subset
   Part 3  github.com/opencontainers/go-digest v1.0.0 (validation parts)
   Part 4  container-libs image/docker/reference     (image name parsing)
+  Part 5  machine connections: pkg/machine/connection and common/pkg/config
+          connections.go (ssh:// connections of a VM, podman-connections.json)
 
 Not ported yet: FamiliarMatch (needs Go's path.Match), the Field encoding
 helper, and everything else in podman, container-libs (common, image
@@ -25,9 +27,15 @@ Design patterns used
 
 from __future__ import absolute_import, division, print_function
 
+import errno
+import fcntl
 import functools
+import io
+import json
+import os
 import re
 import subprocess
+import tempfile
 from collections import OrderedDict
 
 
@@ -968,6 +976,437 @@ def TrimNamed(ref):
     """Go: TrimNamed. Removes any tag or digest from the name."""
     domain, path = SplitHostname(ref)
     return repository(domain, path)
+
+
+# ===========================================================================
+# Part 5: machine connections. Go: podman pkg/machine/connection (connection.go,
+#         add.go) and container-libs common/pkg/config/connections.go.
+#         These are the ssh:// connections of a machine (name and name-root),
+#         the default connection, and the podman-connections.json file.
+# ===========================================================================
+
+LOCALHOST_IP = "127.0.0.1"                       # Go: LocalhostIP
+DEFAULT_MACHINE_NAME = "podman-machine-default"  # Go: define.DefaultMachineName
+CONNECTIONS_FILE = "podman-connections.json"     # Go: connectionsFile
+CONFIG_DIR_NAME = "containers"                   # Go: _configPathName (storage/pkg/configfile)
+
+
+class MachineConnectionError(ValueError):
+    """Error of the connection code. str() is the exact Go message."""
+
+
+# --- Go net/url: URL.String() for scheme, user, host and path ---------------
+#
+# Go's shouldEscape() is a bit table. Its rules are written out here per mode.
+# The cross-check (check_machine_connections.py) compares the results with
+# net/url for random input, including non-ASCII bytes.
+
+_ENC_PATH = "path"
+_ENC_HOST = "host"
+_ENC_USER_PASSWORD = "userPassword"
+
+
+def _should_escape(c, mode):
+    """Go: shouldEscape(c, mode) for one byte value c."""
+    if (0x61 <= c <= 0x7A) or (0x41 <= c <= 0x5A) or (0x30 <= c <= 0x39):
+        return False                       # unreserved: alphanumeric
+    ch = chr(c)
+    if mode == _ENC_HOST and ch in "!$&'()*+,;=:[]<>\"":
+        return False                       # sub-delims and separators allowed in a host
+    if ch in "-_.~":
+        return False                       # unreserved: marks
+    if ch in "$&+,/:;=?@":
+        if mode == _ENC_PATH:
+            return ch == "?"
+        if mode == _ENC_USER_PASSWORD:
+            return ch in "@/?:"
+        return True
+    return True                            # everything else, including bytes >= 0x80
+
+
+def _go_escape(s, mode):
+    """Go: escape(s, mode). Non-ASCII text is escaped as its UTF-8 bytes."""
+    data = s if isinstance(s, bytes) else s.encode("utf-8")
+    out = []
+    for b in bytearray(data):
+        if _should_escape(b, mode):
+            out.append("%%%02X" % b)
+        else:
+            out.append(chr(b))
+    return "".join(out)
+
+
+def _go_url_string(scheme, user, host, path):
+    """Go: (*url.URL).String() for a URL with scheme, user, host and path only.
+
+    user is None for a URL without userinfo. makeSSHURL always passes one.
+    """
+    out = [scheme + ":"]
+    if host or path or user is not None:
+        out.append("//")
+    if user is not None:
+        out.append(_go_escape(user, _ENC_USER_PASSWORD) + "@")
+    if host:
+        out.append(_go_escape(host, _ENC_HOST))
+    escaped_path = "*" if path == "*" else _go_escape(path, _ENC_PATH)
+    if escaped_path and escaped_path[0] != "/" and host:
+        out.append("/")
+    out.append(escaped_path)
+    return "".join(out)
+
+
+def join_host_port(host, port):
+    """Go: net.JoinHostPort. IPv6 literals are put in brackets."""
+    if ":" in host:
+        return "[" + host + "]:" + port
+    return host + ":" + port
+
+
+def make_ssh_url(host, path, port, user_name):
+    """Go: makeSSHURL. Returns the URL string (Go's url.URL.String())."""
+    if len(port) > 0:
+        hostname = join_host_port(host, port)
+    else:
+        hostname = host
+    return _go_url_string("ssh", user_name, hostname, path)
+
+
+def createConnections(name, uid, port, remote_username):
+    """Go: createConnections. The rootless and the rootful connection of a machine."""
+    uri = make_ssh_url(LOCALHOST_IP, "/run/user/%d/podman/podman.sock" % uid,
+                       str(port), remote_username)
+    uri_root = make_ssh_url(LOCALHOST_IP, "/run/podman/podman.sock", str(port), "root")
+    return [(name, uri), (name + "-root", uri_root)]
+
+
+# --- The connections file as a JSON object ----------------------------------
+
+
+def make_destination(uri, identity="", is_machine=False):
+    """Go: config.Destination with the fields the connection code sets.
+
+    Empty Identity and false IsMachine are left out, as Go's omitempty does.
+    """
+    dest = {"URI": uri}
+    if identity:
+        dest["Identity"] = identity
+    if is_machine:
+        dest["IsMachine"] = True
+    return dest
+
+
+def canonical_json(obj):
+    """JSON with sorted keys and no spaces, the form the cross-check compares.
+
+    Non-ASCII text stays as UTF-8, and <, >, & and the two line separators
+    are escaped as backslash-u sequences, as Go's encoder does.
+    """
+    text = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    for ch, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+                    ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+        text = text.replace(ch, esc)
+    return text
+
+
+class ConnectionsFile(object):
+    """Go: config.ConnectionsFile, kept as its JSON object.
+
+    Keys this port does not use (for example TLSCert of a destination, or the
+    farm settings) are kept, so a file written here loses nothing podman needs.
+    connections is None where Go's map is nil, that is, when the key is absent.
+    """
+
+    def __init__(self, raw=None):
+        self.raw = raw if isinstance(raw, dict) else {}
+
+    def _conn(self):
+        conn = self.raw.get("Connection")
+        if not isinstance(conn, dict):
+            conn = {}
+            self.raw["Connection"] = conn
+        return conn
+
+    @property
+    def default(self):
+        return self._conn().get("Default") or ""
+
+    @default.setter
+    def default(self, name):
+        self._conn()["Default"] = name
+
+    @property
+    def connections(self):
+        return self._conn().get("Connections")
+
+    def set_connections(self, mapping):
+        self._conn()["Connections"] = mapping
+
+    def has_connection(self, name):
+        conns = self.connections
+        return conns is not None and name in conns
+
+    def ensure_farm(self):
+        """Go: EditConnectionConfig makes Farm.List non-nil before the callback."""
+        farm = self.raw.get("Farm")
+        if not isinstance(farm, dict):
+            farm = {}
+            self.raw["Farm"] = farm
+        if not isinstance(farm.get("List"), dict):
+            farm["List"] = {}
+
+    def to_text(self):
+        """The file content as Go writes it: omitempty fields left out, one newline at the end."""
+        conn = dict(self._conn())
+        if not conn.get("Default"):
+            conn.pop("Default", None)
+        if not conn.get("Connections"):
+            conn.pop("Connections", None)
+        farm = dict(self.raw.get("Farm") or {})
+        if not farm.get("Default"):
+            farm.pop("Default", None)
+        if not farm.get("List"):
+            farm.pop("List", None)
+        out = dict(self.raw)
+        out["Connection"] = conn
+        out["Farm"] = farm
+        return canonical_json(out) + "\n"
+
+
+def connections_from_text(text, path="podman-connections.json"):
+    """Go: readConnectionConf after the file was read. Empty text is a parse error, as in Go."""
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise MachineConnectionError('parse "%s": %s' % (path, exc))
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise MachineConnectionError('parse "%s": not a JSON object' % path)
+    return ConnectionsFile(raw)
+
+
+def edit_connections_text(text, callback):
+    """Go: EditConnectionConfig without the file. Returns the new text.
+
+    If the callback raises, nothing is returned, so the caller keeps the old
+    text. Go works the same way: it writes only when the callback succeeds.
+    """
+    cfg = connections_from_text(text)
+    cfg.ensure_farm()
+    callback(cfg)
+    return cfg.to_text()
+
+
+# --- Go: the functions that change the connections (callback bodies) -------
+
+
+def addConnection(cfg, cons, identity, is_default):
+    """Go: addConnection. cons is a list of (name, uri) pairs."""
+    if len(identity) < 1:
+        raise MachineConnectionError("identity must be defined")
+    for i, (name, uri) in enumerate(cons):
+        if cfg.has_connection(name):
+            raise MachineConnectionError('cannot overwrite connection "%s"' % name)
+        dst = make_destination(uri, identity, True)
+        if is_default and i == 0:
+            cfg.default = name
+        if cfg.connections is None:
+            cfg.set_connections({name: dst})
+            cfg.default = name
+        else:
+            cfg.connections[name] = dst
+
+
+def AddSSHConnectionsToPodmanSocket(cfg, uid, port, identity_path, name,
+                                    remote_username, rootful, is_default,
+                                    ignition_path=""):
+    """Go: AddSSHConnectionsToPodmanSocket. Returns False where Go adds nothing."""
+    if len(ignition_path) > 0:
+        return False
+    cons = createConnections(name, uid, port, remote_username)
+    # The first connection of an empty file becomes the default, so order by rootful.
+    if rootful:
+        cons[0], cons[1] = cons[1], cons[0]
+    addConnection(cfg, cons, identity_path, is_default)
+    return True
+
+
+def UpdateConnectionPairPort(cfg, name, port, uid, remote_username, identity_path):
+    """Go: UpdateConnectionPairPort. Replaces both connections of a machine.
+
+    Go writes into a nil map here and panics; this port starts an empty map.
+    """
+    cons = createConnections(name, uid, port, remote_username)
+    if cfg.connections is None:
+        cfg.set_connections({})
+    for con_name, uri in cons:
+        cfg.connections[con_name] = make_destination(uri, identity_path, True)
+
+
+def updateConnection(cfg, rootful, name, rootful_name):
+    """Go: updateConnection. Moves the default between a rootless and a rootful name."""
+    if name == cfg.default and rootful:
+        cfg.default = rootful_name
+    elif rootful_name == cfg.default and not rootful:
+        cfg.default = name
+
+
+def UpdateConnectionIfDefault(cfg, rootful, name, rootful_name):
+    updateConnection(cfg, rootful, name, rootful_name)
+
+
+def removal_is_ambiguous(cfg, names):
+    """True if setNewDefaultConnection would pick a connection in Go's map order.
+
+    Go picks the first map entry, which is random. This port picks the first
+    name in sorted order. Callers that compare with Go should skip these cases.
+    """
+    conns = cfg.connections or {}
+    seen = set()
+    for name in names:
+        if name in seen or name not in conns:
+            return False  # an error happens before the choice is made
+        seen.add(name)
+    remaining = [n for n in conns if n not in seen]
+    return DEFAULT_MACHINE_NAME not in remaining and len(remaining) > 1
+
+
+def setNewDefaultConnection(cfg, names):
+    """Go: setNewDefaultConnection. Returns (destination, service name).
+
+    The destination is None where Go returns its zero value.
+    """
+    for name in names:
+        if cfg.has_connection(name):
+            del cfg.connections[name]
+        else:
+            raise MachineConnectionError('unable to find connection named "%s"' % name)
+        if cfg.default == name:
+            cfg.default = ""
+    conns = cfg.connections or {}
+    if DEFAULT_MACHINE_NAME in conns:
+        cfg.default = DEFAULT_MACHINE_NAME
+        return conns[DEFAULT_MACHINE_NAME], DEFAULT_MACHINE_NAME
+    for con in sorted(conns):
+        cfg.default = con
+        return conns[con], con
+    return None, ""
+
+
+def RemoveConnections(cfg, machines, names):
+    """Go: RemoveConnections. machines maps a machine name to its rootful flag."""
+    dest, service = setNewDefaultConnection(cfg, names)
+    if dest is not None and dest.get("IsMachine") and service in machines:
+        updateConnection(cfg, machines[service], service, service + "-root")
+
+
+# --- Go: the read side -------------------------------------------------------
+
+
+def GetConnection(cfg, name, default, active_service="", service_destinations=None):
+    """Go: GetConnection. service_destinations stands for containers.conf destinations."""
+    service_destinations = service_destinations or {}
+    default_con = cfg.default or active_service
+    is_default = default
+    if default:
+        if default_con == "":
+            raise MachineConnectionError("no default connection found")
+        name = default_con
+    else:
+        is_default = default_con == name
+    conns = cfg.connections
+    if conns is not None and name in conns:
+        return {"name": name, "destination": conns[name],
+                "default": is_default, "read_write": True}
+    if name in service_destinations:
+        return {"name": name, "destination": service_destinations[name],
+                "default": is_default, "read_write": False}
+    raise MachineConnectionError('connection "%s" not found' % name)
+
+
+def GetAllConnections(cfg, active_service="", service_destinations=None):
+    """Go: GetAllConnections. Sorted by name here; Go iterates a map."""
+    service_destinations = service_destinations or {}
+    default_con = cfg.default or active_service
+    conns = cfg.connections or {}
+    result = []
+    for name in sorted(conns):
+        result.append({"name": name, "destination": conns[name],
+                       "default": default_con == name, "read_write": True})
+    for name in sorted(service_destinations):
+        if name in conns:
+            continue  # the connections file overrides containers.conf
+        result.append({"name": name, "destination": service_destinations[name],
+                       "default": default_con == name, "read_write": False})
+    return result
+
+
+# --- Go: the file (lock, read, write) ----------------------------------------
+
+
+def connections_config_path():
+    """Go: connectionsConfigFile. PODMAN_CONNECTIONS_CONF wins, then XDG, then $HOME."""
+    if "PODMAN_CONNECTIONS_CONF" in os.environ:
+        return os.environ["PODMAN_CONNECTIONS_CONF"]
+    if "XDG_CONFIG_HOME" in os.environ:
+        base = os.environ["XDG_CONFIG_HOME"]
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, CONFIG_DIR_NAME, CONNECTIONS_FILE)
+
+
+def read_connection_conf(path):
+    """Go: readConnectionConf. A missing file is an empty config."""
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (IOError, OSError) as exc:
+        if exc.errno == errno.ENOENT:
+            return ConnectionsFile()
+        raise
+    return connections_from_text(text, path)
+
+
+def write_connection_conf(path, cfg):
+    """Go: writeConnectionConf. Writes a temporary file and renames it over the old one."""
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".podman-connections-")
+    os.close(fd)
+    try:
+        with io.open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(cfg.to_text())
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def EditConnectionConfig(callback, path=None):
+    """Go: EditConnectionConfig. Locks, reads, calls callback, writes on success.
+
+    The lock is the same kind Go's storage lockfile takes (POSIX record lock on
+    <file>.lock), so the two can exclude each other.
+    """
+    path = path or connections_config_path()
+    directory = os.path.dirname(path) or "."
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    lock_fh = io.open(path + ".lock", "a")
+    try:
+        fcntl.lockf(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            cfg = read_connection_conf(path)
+            cfg.ensure_farm()
+            callback(cfg)
+            write_connection_conf(path, cfg)
+        finally:
+            fcntl.lockf(lock_fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_fh.close()
 
 
 # ===========================================================================

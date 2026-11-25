@@ -2,6 +2,11 @@
 """Tests for podmanlib. Run: python test_podmanlib.py"""
 from __future__ import absolute_import, print_function
 
+import io
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 import podmanlib as pl
@@ -144,6 +149,121 @@ class ReferencePortTest(unittest.TestCase):
                          "docker.io/library/alpine")
         with self.assertRaises(pl.RefError):
             pl.ParseNamed("alpine")  # canonical is docker.io/library/alpine
+
+
+class MachineConnectionsTest(unittest.TestCase):
+    def test_ssh_urls_like_go(self):
+        self.assertEqual(pl.make_ssh_url("127.0.0.1", "/run/user/1000/podman/podman.sock",
+                                         "2222", "core"),
+                         "ssh://core@127.0.0.1:2222/run/user/1000/podman/podman.sock")
+        self.assertEqual(pl.make_ssh_url("127.0.0.1", "/run/podman/podman.sock", "", "root"),
+                         "ssh://root@127.0.0.1/run/podman/podman.sock")
+        self.assertEqual(pl.make_ssh_url("::1", "/x", "22", "root"), "ssh://root@[::1]:22/x")
+        self.assertEqual(pl.make_ssh_url("127.0.0.1", "/a b", "1", "us er"),
+                         "ssh://us%20er@127.0.0.1:1/a%20b")
+        self.assertEqual(pl.make_ssh_url("127.0.0.1", "/x", "1", "a+b,c;d=e$f&g"),
+                         "ssh://a+b,c;d=e$f&g@127.0.0.1:1/x")
+
+    def test_create_connections_pair(self):
+        pair = pl.createConnections("dev", 1000, 2222, "core")
+        self.assertEqual([name for name, _ in pair], ["dev", "dev-root"])
+        self.assertEqual(pair[1][1], "ssh://root@127.0.0.1:2222/run/podman/podman.sock")
+
+    def test_addssh_sets_default_and_pair(self):
+        cfg = pl.ConnectionsFile()
+        pl.AddSSHConnectionsToPodmanSocket(cfg, 1000, 2222, "/key", "dev", "core", False, True)
+        self.assertEqual(cfg.default, "dev")
+        self.assertEqual(sorted(cfg.connections), ["dev", "dev-root"])
+        self.assertTrue(cfg.connections["dev"]["IsMachine"])
+        self.assertEqual(cfg.connections["dev"]["Identity"], "/key")
+
+    def test_duplicate_and_missing_identity_are_errors(self):
+        text = pl.edit_connections_text(
+            "{}", lambda cfg: pl.AddSSHConnectionsToPodmanSocket(
+                cfg, 1000, 2222, "/key", "dev", "core", False, True))
+        with self.assertRaises(pl.MachineConnectionError) as cm:
+            pl.edit_connections_text(text, lambda cfg: pl.AddSSHConnectionsToPodmanSocket(
+                cfg, 1000, 2222, "/key", "dev", "core", False, False))
+        self.assertEqual(str(cm.exception), 'cannot overwrite connection "dev"')
+        with self.assertRaises(pl.MachineConnectionError) as cm:
+            pl.edit_connections_text("{}", lambda cfg: pl.addConnection(
+                cfg, [("x", "ssh://x")], "", False))
+        self.assertEqual(str(cm.exception), "identity must be defined")
+
+    def test_remove_prefers_machine_default(self):
+        cfg = pl.ConnectionsFile()
+        pl.addConnection(cfg, [("a", "ssh://a")], "/k", False)
+        pl.addConnection(cfg, [("podman-machine-default", "ssh://m")], "/k", False)
+        pl.addConnection(cfg, [("z", "ssh://z")], "/k", False)
+        self.assertFalse(pl.removal_is_ambiguous(cfg, ["z"]))
+        pl.RemoveConnections(cfg, {}, ["z"])
+        self.assertEqual(cfg.default, pl.DEFAULT_MACHINE_NAME)
+
+    def test_ambiguous_removal_is_flagged(self):
+        cfg = pl.ConnectionsFile()
+        pl.addConnection(cfg, [("a", "ssh://a")], "/k", True)
+        pl.addConnection(cfg, [("b", "ssh://b")], "/k", False)
+        pl.addConnection(cfg, [("c", "ssh://c")], "/k", False)
+        self.assertTrue(pl.removal_is_ambiguous(cfg, ["a"]))
+        self.assertFalse(pl.removal_is_ambiguous(cfg, ["nope"]))
+
+    def test_removing_all_leaves_go_shaped_file(self):
+        text = pl.edit_connections_text("{}", lambda cfg: pl.addConnection(
+            cfg, [("only", "ssh://o")], "/k", True))
+        text = pl.edit_connections_text(text, lambda cfg: pl.RemoveConnections(cfg, {}, ["only"]))
+        self.assertEqual(text, '{"Connection":{},"Farm":{}}\n')
+
+    def test_unknown_keys_survive_an_edit(self):
+        text = ('{"Connection":{"Connections":{"x":{"URI":"ssh://x","TLSCert":"/c.pem"}}},'
+                '"Farm":{"Default":"f"}}')
+        new = pl.edit_connections_text(text, lambda cfg: pl.UpdateConnectionPairPort(
+            cfg, "dev", 22, 1000, "core", "/k"))
+        self.assertEqual(pl.connections_from_text(new).raw["Connection"]["Connections"]["x"]
+                         ["TLSCert"], "/c.pem")
+        self.assertEqual(pl.connections_from_text(new).raw["Farm"]["Default"], "f")
+
+    def test_failed_callback_writes_nothing(self):
+        def bad(cfg):
+            pl.addConnection(cfg, [("n", "ssh://n")], "/k", True)
+            raise pl.MachineConnectionError("stop")
+        with self.assertRaises(pl.MachineConnectionError):
+            pl.edit_connections_text("{}", bad)
+
+    def test_get_connection_and_read_only_destinations(self):
+        cfg = pl.connections_from_text('{"Connection":{"Default":"dev","Connections":'
+                                       '{"dev":{"URI":"ssh://d","IsMachine":true}}}}')
+        got = pl.GetConnection(cfg, "", True, service_destinations={})
+        self.assertEqual(got["name"], "dev")
+        ro = pl.GetConnection(cfg, "ro", False, service_destinations={"ro": {"URI": "tcp://x"}})
+        self.assertFalse(ro["read_write"])
+        self.assertFalse(ro["default"])
+        with self.assertRaises(pl.MachineConnectionError):
+            pl.GetConnection(cfg, "missing", False)
+
+    def test_file_is_written_and_read_back(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, "sub", "podman-connections.json")
+            pl.EditConnectionConfig(lambda cfg: pl.addConnection(cfg, [("d", "ssh://d")], "/k", True),
+                                    path=path)
+            with io.open(path, encoding="utf-8") as fh:
+                self.assertEqual(json.loads(fh.read())["Connection"]["Default"], "d")
+            self.assertTrue(os.path.exists(path + ".lock"))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_config_path_follows_go_order(self):
+        saved = dict(os.environ)
+        try:
+            os.environ["PODMAN_CONNECTIONS_CONF"] = "/explicit.json"
+            self.assertEqual(pl.connections_config_path(), "/explicit.json")
+            del os.environ["PODMAN_CONNECTIONS_CONF"]
+            os.environ["XDG_CONFIG_HOME"] = "/xdg"
+            self.assertEqual(pl.connections_config_path(),
+                             os.path.join("/xdg", "containers", "podman-connections.json"))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
 
 if __name__ == "__main__":

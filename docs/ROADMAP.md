@@ -16,6 +16,7 @@ is usually about the same size.
 | go-digest validation                          | ~250               | ported, cross-checked  |
 | `golang.org/x/mod/semver`                     | ~400               | ported, cross-checked  |
 | go.mod reader                                 | -                  | own code               |
+| Machine connections: `pkg/machine/connection`, `common/pkg/config/connections.go` (the ssh connections of a VM and their file) | ~1000 (connection.go, add.go, connections.go) | ported, cross-checked (11,741 operations). Relevant for 2.4 too: the same file. |
 
 ## Tier 1: get an image into local storage
 
