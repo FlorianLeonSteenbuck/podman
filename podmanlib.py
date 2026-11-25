@@ -12,6 +12,7 @@ Ported so far
   Part 4  container-libs image/docker/reference     (image name parsing)
   Part 6  image manifests: media types, digest, the platform of this machine,
           choosing an image from an OCI index or a Docker manifest list
+  Part 7  command line helpers: flags without argparse, exit status, not-implemented
   Part 5  machine connections: pkg/machine/connection and common/pkg/config
           connections.go (ssh:// connections of a VM, podman-connections.json)
 
@@ -1822,6 +1823,67 @@ def Schema2ListChooseInstance(manifests, ctx=None):
     raise ManifestError('no image found in manifest list for architecture "%s", '
                         'variant "%s", OS "%s"'
                         % (first["architecture"], first["variant"], first["os"]))
+
+
+# ===========================================================================
+# Part 7: command line helpers. No argparse: flags are parsed here, by hand.
+# ===========================================================================
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_NOT_IMPLEMENTED = 3
+
+
+class CliUsageError(ValueError):
+    """A command line that cannot be used. The message says what is wrong."""
+
+
+def take_flags(argv, spec):
+    """Parse --name, --name value, --name=value and boolean flags.
+
+    spec maps each flag to "value" (takes an argument) or "bool". Returns
+    (options, positionals). Unknown flags and missing values are usage errors.
+    """
+    options = {}
+    positionals = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--"):
+            name, eq, inline = arg.partition("=")
+            if name not in spec:
+                raise CliUsageError("unknown flag %s" % name)
+            if spec[name] == "bool":
+                if not eq:
+                    options[name] = True
+                elif inline.lower() in ("true", "1"):
+                    options[name] = True
+                elif inline.lower() in ("false", "0"):
+                    options[name] = False
+                else:
+                    raise CliUsageError("%s takes true or false" % name)
+            else:
+                if eq:
+                    options[name] = inline
+                else:
+                    if i + 1 >= len(argv):
+                        raise CliUsageError("%s needs a value" % name)
+                    i += 1
+                    options[name] = argv[i]
+        else:
+            positionals.append(arg)
+        i += 1
+    return options, positionals
+
+
+def not_implemented(program, command, roadmap=""):
+    """Tell the user that a command is not ported yet. Returns the exit status."""
+    message = "%s %s: not implemented in this rewrite yet" % (program, command)
+    if roadmap:
+        message += " (see docs/ROADMAP.md: %s)" % roadmap
+    sys.stderr.write(message + "\n")
+    return EXIT_NOT_IMPLEMENTED
 
 
 # ===========================================================================

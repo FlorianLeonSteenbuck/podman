@@ -38,6 +38,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: unit tests
         run: python test_podmanlib.py
+      - name: command line tests
+        run: python test_cli.py
       - name: image reference CLI
         run: python image_reference.py alpine:3.20 Ubuntu
       - name: machine connections CLI on a temporary file
@@ -56,8 +58,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - run: python -m py_compile podmanlib.py machine_connections.py test_podmanlib.py
+      - run: python -m py_compile podmanlib.py machine_connections.py test_podmanlib.py podman.py
       - run: python test_podmanlib.py
+      - run: python test_cli.py
 
   crosscheck:
     name: cross-check against the Go originals

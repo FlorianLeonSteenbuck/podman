@@ -35,6 +35,11 @@ Not yet ported:
 | `check_reference_port.py`      | Checks the reference and digest ports against the Go original |
 | `check_manifest_port.py`       | Checks the manifest port against the Go original |
 | `check_machine_connections.py` | Checks the machine connection code against the Go original |
+| `podman.py`                    | Command line: `podman` with the commands that exist here (version, image parse, manifest guess, digest and choose, machine connection); the others exit with status 3 |
+| `skopeo.py`                    | Command line: `skopeo` (version; the rest not implemented) |
+| `buildah.py`                   | Command line: `buildah` (version; image build is out of scope) |
+| `podman_machine_os.py`         | Command line: `podman-machine-os` (version; the rest not implemented) |
+| `test_cli.py`                  | Tests of the command line programs |
 | `test_podmanlib.py`            | Unit tests |
 | `.github/workflows/ci.yml`     | CI: lint, unit tests on several Python versions, a Python 2.7 run, and the cross-checks |
 | `docs/ROADMAP.md`              | What is left to run containers, in order |
@@ -57,6 +62,24 @@ Not yet ported:
 Go identifiers are kept on purpose, so each function can be read next to the
 Go function it came from. Go's `$` is written as `\Z` in the patterns, because
 Python's `$` also matches before a final newline.
+
+## Command line
+
+The four programs you listed exist as Python scripts with the same names. Commands that
+are ported run for real. The others are known by name and exit with status 3 and a
+pointer to the roadmap.
+
+```bash
+python3 podman.py version
+python3 podman.py image parse alpine:3.20
+python3 podman.py manifest choose index.json --arch arm64 --os linux
+python3 podman.py machine connection list
+python3 podman.py pull alpine        # not implemented yet, exit status 3
+python3 skopeo.py copy a b           # not implemented yet, exit status 3
+python3 buildah.py build .           # out of scope, exit status 3
+```
+
+Exit status: 0 ok, 1 operation failed, 2 usage error, 3 not implemented.
 
 ## Usage
 
@@ -92,7 +115,7 @@ the checkout or the `go` binary is missing.
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 - **lint**: pyflakes on all Python files.
-- **unit**: the unit tests on Python 3.10, 3.12 and 3.13, plus smoke runs of the CLIs.
+- **unit**: the unit tests and the command line tests on Python 3.10, 3.12 and 3.13, plus smoke runs.
 - **python27**: the unit tests on Python 2.7. This job is informational (`continue-on-error`).
 - **crosscheck**: clones the upstream repositories shallowly, then runs the four checks
   against the Go original.
